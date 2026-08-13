@@ -1,0 +1,14 @@
+[
+  "leaf", "home", "home-outline", "categories", "cart", "cart-outline",
+  "orders", "account", "account-outline", "back", "forward", "add", "remove",
+  "close", "check", "check-circle", "search", "tune", "sort", "expand",
+  "delete", "replay", "add-to-cart", "bolt", "favorite", "delivery-scooter",
+  "car", "storefront", "parking", "card", "wallet", "cash", "info",
+  "bell-active", "call", "truck", "arrow-in", "shield", "support", "chevron",
+  "receipt", "calendar", "handshake", "location", "notifications", "lock",
+  "error", "schedule", "basket", "promo", "inventory", "offline", "signal",
+  "wifi", "battery", "language", "cat-fruits", "cat-dairy", "cat-bakery",
+  "cat-beverages", "cat-snacks", "cat-meat", "cat-household", "cat-baby",
+  "p-water", "p-juice", "p-energy", "p-tea", "p-cola", "p-milk", "p-banana",
+  "p-eggs", "p-bread", "google", "apple", "whatsapp"
+]

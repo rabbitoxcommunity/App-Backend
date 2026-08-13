@@ -1,0 +1,1683 @@
+================================================================================
+FRESHCART — BACKEND DESIGN  (v2)
+Multi-tenant grocery-delivery SaaS
+Node.js · Express · MongoDB (Mongoose)
+================================================================================
+Revision 2, 13 August 2026. Supersedes v1 (single-tenant).
+Design only. No implementation yet.
+
+WHAT CHANGED FROM v1
+  v1 designed one supermarket with two clients. This is a MULTI-TENANT SaaS:
+  many supermarkets ("tenants"), each with their own customers, catalogue,
+  staff and branding, on one shared server and one shared database.
+
+  That single change touches every collection, every query and every route.
+  It is the reason section 1 comes before the data model.
+
+ONE SERVER, FOUR CLIENTS
+  1. Customer app        React Native (Expo)   — public API
+  2. Store admin CMS     PWA                   — /admin
+  3. Delivery staff app  PWA                   — /delivery      (not built yet)
+  4. Super admin portal  Web                   — /platform      (not built yet)
+
+  Clients 3 and 4 do not exist. Their endpoints are specified here and built
+  server-side, so the frontends have something to be written against.
+
+SOURCE OF TRUTH
+  Schemas derive from the app's real type layer, src/data/types.ts, and the
+  module scope in CMS-SCOPE.txt. Field names match the app unless a DEPARTURE
+  says otherwise. Where this document departs, it says so and gives a reason.
+
+
+================================================================================
+0. DECISIONS SETTLED  (locked — do not relitigate without changing this doc)
+================================================================================
+
+  D1  Multi-tenancy         Shared DB, shared collections, `tenantId` on every
+                            tenant-scoped document. Enforced by middleware.
+  D2  Tenant per business   One supermarket = one tenant = ONE location.
+                            No branches. No per-branch stock or pricing.
+  D3  Bilingual format      Nested `{ en, ar }` (Localized), NOT name_en/name_ar.
+  D4  Category browsing     KEPT. The app's Categories tab and Category listing
+                            screen stay. Categories are a browse surface, not
+                            just a filter.
+  D5  Fulfillment types     `delivery` | `curbside`. Two options only.
+  D6  Delivery slots        DROPPED. No scheduling. Delivery is ASAP.
+  D7  Credit balance        Running balance. balance = sum of ALL ledger entries
+                            (charges positive, payments negative). Each entry
+                            stores `balanceAfter`.
+  D8  Stock                 Three-state flag (available|low|out). Never a count.
+                            Never decremented. Oversell is accepted — see §9.
+  D9  Error envelope        { error: { code, message, details } }
+  D10 Identifiers           MongoDB ObjectId, exposed as string `id`.
+  D11 Endpoint shapes       The backend defines them. Clients adapt.
+  D12 Payment gateway       v2. v1 records a payment method and takes no money.
+  D13 Push notifications    Expo Push (wraps APNs + FCM). Not FCM direct.
+  D14 Tenant billing        Real invoicing. Collection payment is manual in v1
+                            (follows from D12).
+  D15 Promos / banners /    All three SURVIVE. They exist in the app and in
+      curbside car details  CMS-SCOPE modules 07, 08, 09.
+
+ASSUMPTIONS I MADE — correct me if wrong
+  A1  Each supermarket ships its OWN app build (white-label). The tenant is
+      baked into app config, not chosen by the customer at runtime. See §2.
+      This follows from "existing supermarkets bring their existing customers".
+  A2  A customer belongs to exactly one tenant. The same phone number at two
+      supermarkets is two separate customer records.
+  A3  `curbside` replaces `pickup` on the wire. The app currently says
+      `pickup`; this is a small app-side rename. Status names inside the
+      curbside chain keep the app's existing spelling.
+
+
+================================================================================
+1. MULTI-TENANCY — THE FOUNDATION
+================================================================================
+Build this first. Everything else depends on it, and a leak here is the
+worst bug this system can have: one supermarket reading another's customers.
+
+1.1  THE RULE
+     Every tenant-scoped collection carries `tenantId: ObjectId, indexed`.
+     Every tenant-scoped query filters on it.
+     No route handler is trusted to remember. It is structural.
+
+1.2  HOW A TENANT IS RESOLVED
+     Resolution order, first match wins:
+
+       1. Authenticated request → `tenantId` claim inside the JWT.
+       2. Public/unauthenticated request → `X-Tenant-Id` header, sent by
+          every client build.
+       3. Super admin acting cross-tenant → explicit `?tenantId=` query
+          param, allowed ONLY for role `superAdmin`.
+
+     RULE: if a JWT carries a tenantId AND a header is present and they
+     disagree, reject with 403 TENANT_MISMATCH. Never let the header win
+     over the token.
+
+1.3  HOW ISOLATION IS ENFORCED
+     Two layers, because one is not enough.
+
+     Layer 1 — request context
+       An AsyncLocalStorage store holds { tenantId, userId, role, requestId }
+       for the life of the request, set by `tenantContext` middleware before
+       any handler runs.
+
+     Layer 2 — Mongoose plugin  ← the important one
+       A global plugin applied to every tenant-scoped schema:
+         - pre-hook on find, findOne, findOneAndUpdate, count, aggregate,
+           updateMany, deleteMany, distinct: inject `tenantId` from context
+           if not already present.
+         - pre-validate on save: stamp `tenantId` from context.
+         - if context has no tenantId and the role is not superAdmin, THROW.
+           A missing tenant is a bug, not a wildcard.
+
+     RULE: the plugin fails closed. An un-scoped query on a tenant-scoped
+     collection is an exception, never a full-collection scan.
+
+     NOTE ON AGGREGATIONS: the plugin injects a `$match` stage at position 0.
+     Any aggregation written by hand must not assume it is first. This is the
+     most likely place isolation silently breaks — cover it in tests.
+
+1.4  WHAT IS **NOT** TENANT-SCOPED
+     tenants, platformUsers (super admins), plans, invoices, iconCatalog,
+     and the platform-level audit log. Everything else is scoped.
+
+1.5  COMPOUND INDEX RULE
+     `tenantId` is the FIRST key of every index on a tenant-scoped
+     collection. An index that does not lead with tenantId will not be used
+     by the scoped query and is dead weight. This is repeated in §12 and it
+     is not optional.
+
+1.6  TESTING THE BOUNDARY
+     A dedicated suite seeds two tenants with identical-looking data and
+     asserts every list, get, update and delete endpoint returns or touches
+     only tenant A's rows when called with tenant A's token. New endpoints
+     do not merge without a row in that suite.
+
+
+================================================================================
+2. STACK, CONVENTIONS AND TOPOLOGY
+================================================================================
+
+  Runtime        Node 20 LTS
+  Framework      Express 4
+  Database       MongoDB 7, Mongoose 8 — REPLICA SET REQUIRED (see below)
+  Validation     Zod at every route boundary, before the handler runs
+  Auth           JWT access token (60 min) + rotating refresh token (60 days)
+  Passwords      argon2. Staff/admin only — customers never have one.
+  Realtime       Socket.io, namespaced per tenant (§14)
+  Push           Expo Push (§15)
+  Files          Presigned direct-to-storage upload, S3-compatible (§16)
+  Jobs           BullMQ + Redis — Excel import, rider timeouts, rollups,
+                 invoice generation
+  Logging        pino, requestId + tenantId on every line
+  Testing        vitest + mongodb-memory-server (replica-set mode)
+
+TOPOLOGY — READ THIS BEFORE INSTALLING MONGO
+  This design uses multi-document transactions in six places (§13). MongoDB
+  cannot run a transaction on a standalone `mongod`, which is the default
+  local install. Dev must run a single-node REPLICA SET (trivial via Docker);
+  prod runs Atlas or a 3-node set. mongodb-memory-server must be started in
+  replica-set mode or every transaction test fails.
+
+API VERSIONING
+  All routes under `/api/v1`. The app's existing base URL is
+  `http://localhost:4000/api` — it gains the `/v1` segment. Decided now
+  because adding it later breaks every deployed build.
+
+CONVENTIONS
+  - Every response is JSON. Errors share one shape (§11).
+  - Every collection stores createdAt / updatedAt (Mongoose timestamps).
+  - Documents expose `id` (string). `_id`, `__v` and `tenantId` are stripped
+    in toJSON. Clients never see tenantId — they cannot influence it anyway.
+  - Soft delete via `archivedAt` on catalogue documents. Orders, ledger
+    entries and invoices are never deleted.
+  - Money is an integer count of fils (§10).
+  - All timestamps stored UTC. All date-boundary logic uses the tenant's
+    timezone, default `Asia/Dubai` (§17).
+  - Lists paginate. Admin tables use offset (`?page=&limit=`) and return
+    `total`. Order queues and ledgers use cursor (`?cursor=&limit=`) and
+    return `nextCursor` — see §12.
+
+
+================================================================================
+3. PROJECT STRUCTURE
+================================================================================
+
+  src/
+    server.ts                 bootstrap, graceful shutdown
+    app.ts                    express instance, middleware chain
+    config/
+      env.ts                  zod-validated process.env, fails fast
+      db.ts                   mongoose connection
+      redis.ts
+    context/
+      requestContext.ts       AsyncLocalStorage store (§1.3)
+    plugins/
+      tenantScope.ts          the isolation plugin (§1.3) — most important file
+      toJSON.ts
+    models/                   one file per collection (§4)
+    modules/
+      auth/                   OTP, refresh rotation, staff login
+      tenants/                onboarding, config, branding
+      catalog/                categories, products, variants
+      import/                 Excel ingest, column mapping, variant grouping
+      cart/                   the pricing engine (§8)
+      orders/                 state machine (§9), assignment (§9.5)
+      delivery/               staff app endpoints, proof of delivery
+      customers/
+      addresses/
+      credit/                 the ledger (§7)
+      promos/
+      curbside/               bays, arrival queue, car profiles
+      merchandising/          banners, popular, trending
+      content/                legal pages, translation strings
+      notifications/          Expo push, back-in-stock
+      analytics/              rollups + queries (§18)
+      platform/               super admin: tenants, plans, invoices (§19)
+    middleware/
+      tenantContext.ts        resolves tenantId (§1.2)
+      auth.ts                 requireRole(...), requireTenant
+      validate.ts             zod wrapper
+      idempotency.ts          §13.3
+      error.ts                central error handler
+      rateLimit.ts
+    realtime/
+      io.ts                   Socket.io server, per-tenant namespaces
+    jobs/
+      queues.ts, importProduct.ts, riderTimeout.ts, rollups.ts, invoices.ts
+    lib/
+      money.ts, localized.ts, reference.ts, phone.ts, crypto.ts
+    seed/
+      index.ts
+
+
+================================================================================
+4. DATA MODEL
+================================================================================
+24 collections. 19 tenant-scoped, 5 platform-level.
+
+--------------------------------------------------------------------------------
+SHARED SUBDOCUMENT — Localized
+--------------------------------------------------------------------------------
+  { en: String, ar: String }
+
+  Used by: category and subcategory names, product names/subtitles/
+  descriptions/shelf, variant axis and option names, address label/lines,
+  payment titles, order line name/variantLabel, rider name, credit entry
+  title/subtitle, car colour, legal copy, tenant display name.
+
+  RULE: for any document with `status: 'published'`, BOTH languages are
+  required. The app has no fallback path — a missing `ar` renders an empty
+  string to an Arabic customer.
+
+  RULE: for `status: 'draft'`, `ar` may be empty. This exists so a manager
+  who does not write Arabic can still save a product, and so Excel import
+  can land rows before translation. Public endpoints NEVER return drafts.
+
+  DEPARTURE FROM THE BUILD PROMPT: the prompt specified flat `name_en` /
+  `name_ar`. Overruled by D3 — the app reads nested `{en, ar}` everywhere and
+  changing it would touch every screen. Note that the comment in the app's
+  api/client.ts ("the backend returns both name_en and name_ar") is stale and
+  should be corrected.
+
+
+================================ PLATFORM LEVEL ================================
+
+--------------------------------------------------------------------------------
+4.1  tenants                                              NOT tenant-scoped
+--------------------------------------------------------------------------------
+  slug              String, unique, indexed    "al-noor-mart"
+  name              Localized
+  status            String, enum: trial | active | suspended | cancelled
+  branding          { logoUrl, primaryHex, appIconUrl }
+  contact           { ownerName, email, phone }
+  locale            { defaultLanguage: en|ar, timezone (default Asia/Dubai) }
+  store             { name: Localized, details: Localized,
+                      address: Localized, phone,
+                      geo: { lat, lng },
+                      bays: Number, baysFree: Number }
+  settings          { currency: "AED" (fixed),
+                      deliveryFee (fils), deliveryEtaMinutes,
+                      minOrder (fils) | null,
+                      curbsideEnabled, creditEnabled, cashEnabled,
+                      defaultCreditLimit (fils),
+                      carColours: [{ hex, name: Localized }],
+                      carBodyTypes: [sedan|suv|pickup|coupe],
+                      openingHours: [{ day, opens, closes, closed }],
+                      holidays: [{ date, note: Localized }] }
+  gateway           { provider: telr|paytabs|null,
+                      credentialsEnc: String | null }   v2, see §12 note
+  plan              { planId, startedAt, trialEndsAt, seats }
+  createdAt, suspendedAt
+
+  NOTE — D2: `store` is a single embedded object, not a collection. One tenant
+  has one location. If branches are ever needed, this becomes a collection and
+  stock moves to a per-store document — a large change, deliberately deferred.
+
+  RULE: `gateway.credentialsEnc` is encrypted at rest with envelope
+  encryption (AES-256-GCM, key from KMS/env, never the app secret). It is
+  never returned by any endpoint, not even to a super admin — write-only.
+
+--------------------------------------------------------------------------------
+4.2  platformUsers                                        NOT tenant-scoped
+--------------------------------------------------------------------------------
+  email (unique), passwordHash (argon2), name, role: superAdmin,
+  active, lastLoginAt, mfaSecret | null
+
+--------------------------------------------------------------------------------
+4.3  plans                                                NOT tenant-scoped
+--------------------------------------------------------------------------------
+  code (unique), name: Localized, priceMonthly (fils),
+  limits { products, ordersPerMonth, staffSeats },
+  features [String], active
+
+--------------------------------------------------------------------------------
+4.4  invoices                                             NOT tenant-scoped
+--------------------------------------------------------------------------------
+  tenantId          ObjectId -> tenants, indexed
+  number            String, unique       "INV-2026-0043"
+  periodStart       Date
+  periodEnd         Date
+  lines             [{ description, quantity, unitPrice (fils), amount }]
+  subtotal          Number (fils)
+  vatRate           Number    UAE VAT, default 5
+  vatAmount         Number (fils)
+  total             Number (fils)
+  status            String, enum: draft | issued | paid | overdue | void
+  issuedAt, dueAt, paidAt
+  paymentRef        String | null        manual reference in v1 (D14)
+
+  NOTE: generated by a monthly job (§19.3). Collection of payment is manual
+  in v1 because there is no gateway (D12) — an owner marks an invoice paid
+  and records a reference.
+
+--------------------------------------------------------------------------------
+4.5  iconCatalog                                          NOT tenant-scoped
+--------------------------------------------------------------------------------
+  A checked-in JSON list, not a collection you edit. 73 names, generated from
+  the app's GLYPHS map in src/components/Icon.tsx. See §6.
+
+
+================================ TENANT SCOPED =================================
+Every collection below carries `tenantId: ObjectId, indexed`. It is written
+once here and assumed thereafter.
+
+--------------------------------------------------------------------------------
+4.6  users
+--------------------------------------------------------------------------------
+One collection for every human inside a tenant. Role decides the shape.
+
+  role            String, enum: storeAdmin | deliveryStaff | customer
+  status          String, enum: active | blocked | offShift
+  name            String
+  phone           String, E.164
+  email           String | null            staff only
+  passwordHash    String | null            staff only, argon2
+  language        String, enum: en|ar, default from tenant
+  pushTokens      [{ token, platform: ios|android, updatedAt }]
+
+  -- customer only
+  creditApproved  Boolean, default false
+  blockedAt       Date | null
+
+  -- deliveryStaff only
+  vehicle         { type: bike|van|car, plate } | null
+  availability    String, enum: available | on_delivery | off_shift
+  activeOrderIds  [ObjectId]
+  stats           { completedToday, avgMinutes }
+
+  -- storeAdmin only
+  permissions     String, enum: owner | manager | staff       see §5.2
+
+  INDEXES
+    { tenantId: 1, phone: 1 } unique
+    { tenantId: 1, email: 1 } unique sparse
+    { tenantId: 1, role: 1, status: 1 }
+    { tenantId: 1, role: 1, availability: 1 }   rider assignment (§9.5)
+
+  RULE (A2): phone is unique WITHIN a tenant, not globally. The same person
+  shopping at two FreshCart supermarkets is two customer records with two
+  carts, two credit accounts and two order histories. This is correct for a
+  white-label SaaS and must not be "fixed" later without a migration plan.
+
+  DEPARTURE: v1 had separate `customers`, `riders` and `adminUsers`. Merged,
+  because the build prompt's four roles overlap heavily (all have a phone, a
+  name, a language, a status) and because a delivery staff member is a person
+  who logs in — the same thing an admin is.
+
+--------------------------------------------------------------------------------
+4.7  categories
+--------------------------------------------------------------------------------
+  slug            String, indexed        unique per tenant
+  name            Localized
+  imageUrl        String | null          tile artwork
+  icon            String, enum: IconName fallback glyph (§6)
+  sortOrder       Number
+  visible         Boolean, default true
+  subcategories   [{ _id, slug, name: Localized, sortOrder }]
+  status          String, enum: draft | published
+  archivedAt      Date | null
+
+  INDEX { tenantId: 1, slug: 1 } unique
+
+  DEPARTURE: the app types `Category.image` as a bundled ImageSourcePropType
+  (a local `require`). Server-driven categories must send a URL instead.
+  App-side change: `image: ImageSourcePropType` → `imageUrl?: string`, and
+  CategoryImage falls back to `icon` while it loads. Small, but mandatory —
+  categories cannot be dynamic otherwise.
+
+  NOTE — `visible` vs `archivedAt`: they are different. Hidden means "not
+  shown to customers but still owned and reportable". Archived means "gone".
+  The CMS shows both states; v1 conflated them.
+
+  NOTE — `Subcategory.count` in the app's type is DERIVED. Do not store it.
+  Compute on read or it goes stale the moment stock changes.
+
+--------------------------------------------------------------------------------
+4.8  products
+--------------------------------------------------------------------------------
+  categoryId       ObjectId -> categories, indexed, NULLABLE
+  subcategoryId    ObjectId | null        refers to embedded subcategory _id
+  name             Localized
+  subtitle         Localized
+  description      Localized | null
+  shelf            Localized | null
+  imageUrl         String | null
+  icon             String, enum: IconName
+  axes             [{ _id, slug, name: Localized,
+                      options: [{ _id, slug, name: Localized }] }]
+  variants         [variantSchema]
+  defaultVariantId ObjectId
+  popularity       Number, indexed        drives "Popular"
+  searchTokens     [String], indexed      normalised, see §20
+  status           String, enum: draft | published
+  importBatchId    ObjectId | null        provenance for Excel rows
+  archivedAt       Date | null
+  createdAt        Date, indexed          drives "Newest"
+
+  variantSchema (embedded — variants are never queried independently of their
+  product, and a product has single-digit SKUs):
+    _id             ObjectId
+    optionIds       Map<String, ObjectId>   axis _id -> option _id
+    price           Number (fils)
+    compareAtPrice  Number (fils) | null
+    barcode         String | null
+    stock           String, enum: available | low | out
+    lowStockCount   Number | null
+    archivedAt      Date | null
+
+  INDEXES
+    { tenantId: 1, categoryId: 1, status: 1, archivedAt: 1 }
+    { tenantId: 1, popularity: -1 }
+    { tenantId: 1, createdAt: -1 }
+    { tenantId: 1, searchTokens: 1 }
+    { tenantId: 1, "variants.barcode": 1 } unique sparse   ← QuickStock scan
+    { tenantId: 1, "variants._id": 1 }                     ← pricing lookup
+
+  NOTE — categoryId is NULLABLE (D4 notwithstanding). Excel import produces
+  rows whose category cannot be matched; they land uncategorised and appear
+  in a CMS "needs fixing" queue rather than being rejected. Uncategorised
+  products are excluded from public browse but findable in admin.
+
+  NOTE ON STOCK (D8): a three-state flag set by staff, never a live count.
+  The app's own type comment says so, and there is no POS integration to
+  source real quantities from. `lowStockCount` is a display hint only
+  ("Only 3 left") and MUST NOT be decremented on purchase. The consequence
+  is oversell — handled in §9.6, not prevented.
+
+  DEPARTURE: v1 used `slug` for axes, options and subcategories while the
+  app's types use `id`. Per D10 these are ObjectIds. `slug` is retained
+  ALONGSIDE the id on categories and subcategories only, because those appear
+  in deep links and need to be stable and human-readable. Axes and options
+  keep a slug for Excel column mapping, not for addressing.
+
+--------------------------------------------------------------------------------
+4.9  addresses
+--------------------------------------------------------------------------------
+  customerId      ObjectId -> users, indexed
+  label           Localized
+  lines           Localized
+  phone           String | null
+  geo             { lat, lng } | null
+  isPrimary       Boolean
+  archivedAt      Date | null
+
+  RULE: exactly one primary per customer. Enforced in a transaction (§13.1)
+  — the app's AddressesContext assumes this invariant and never clears the
+  previous winner itself.
+
+--------------------------------------------------------------------------------
+4.10 otpChallenges
+--------------------------------------------------------------------------------
+  phone           String, indexed
+  codeHash        String                 argon2, never the plain code
+  channel         String, enum: sms | whatsapp
+  attempts        Number, default 0
+  expiresAt       Date                   TTL index, 5 minutes
+  consumedAt      Date | null
+  ip              String
+
+  TTL index on expiresAt gives automatic cleanup.
+
+--------------------------------------------------------------------------------
+4.11 refreshTokens
+--------------------------------------------------------------------------------
+  userId          ObjectId, indexed
+  tokenHash       String, unique         sha256 of the opaque token
+  familyId        ObjectId, indexed      rotation lineage
+  replacedBy      ObjectId | null
+  expiresAt       Date                   TTL index, 60 days
+  revokedAt       Date | null
+  userAgent, ip
+
+  See §5.3 for rotation and reuse detection.
+
+--------------------------------------------------------------------------------
+4.12 orders
+--------------------------------------------------------------------------------
+  reference        String, indexed        server-issued, "FC-2841"
+  customerId       ObjectId -> users, indexed
+  fulfillment      String, enum: delivery | curbside
+  status           String, enum: OrderStatus (8 values, §9)
+  placedAt         Date, indexed
+  events           [{ status, at: Date, note: Localized|null, byUserId }]
+  lines            [orderLineSchema]
+  subtotal         Number (fils)
+  deliveryFee      Number (fils)
+  discount         Number (fils)
+  total            Number (fils)
+  paymentKind      String, enum: card | credit | cash
+  paymentStatus    String, enum: pending | collected | settled | refunded
+  confirmationCode String                 server-issued, 4 digits
+  promoCode        String | null
+  addressSnapshot  { label, lines, phone, geo } | null
+  rider            { userId, name: Localized, phone, etaMinutes } | null
+  assignment       { assignedAt, attempts, lastOfferedTo } | null
+  estimatedAt      Date | null
+  car              { plate, colour: Localized,
+                     colourHex, bodyType } | null          curbside only
+  bay              Number | null                           curbside only
+  arrival          String, enum: on_way | near | null
+  proof            { code Boolean, photoUrl, geo, amountCollected } | null
+  cancelledAt      Date | null
+  cancelReason     String | null
+  cancelledBy      ObjectId | null
+  idempotencyKey   String | null
+
+  orderLineSchema:
+    productId      ObjectId
+    variantId      ObjectId
+    quantity       Number
+    unitPrice      Number (fils)   captured at purchase
+    lineTotal      Number (fils)
+    name           Localized       snapshot
+    variantLabel   Localized       snapshot
+    icon           String          snapshot
+    fulfilledQty   Number          defaults to quantity, §9.6
+    substitutedFor ObjectId | null
+
+  INDEXES
+    { tenantId: 1, customerId: 1, placedAt: -1 }
+    { tenantId: 1, status: 1, placedAt: -1 }        the CMS live queue
+    { tenantId: 1, fulfillment: 1, status: 1 }      curbside arrival queue
+    { tenantId: 1, "rider.userId": 1, status: 1 }   delivery staff app
+    { tenantId: 1, reference: 1 } unique
+    { tenantId: 1, idempotencyKey: 1 } unique sparse
+
+  NOTE ON SNAPSHOTS: the app's type stores `addressId`, but an address the
+  customer later edits would silently rewrite the history of a delivered
+  order. Store a snapshot instead. Same reasoning the line items already
+  apply to price — the app's own comment on `unitPrice` says "the catalogue
+  may change later". Apply it consistently.
+
+  DEPARTURE: `car`, `arrival`, `bay` and `proof` are not on the app's Order
+  type. CheckoutScreen collects car and arrival and DISCARDS them at submit
+  (CMS-SCOPE §2 flags both as HIGH). Curbside staff cannot work without them.
+
+  DEPARTURE: `slotId` / `slotLabel` are GONE per D6.
+
+--------------------------------------------------------------------------------
+4.13 creditAccounts
+--------------------------------------------------------------------------------
+  customerId      ObjectId -> users, unique per tenant, indexed
+  limit           Number (fils)
+  balance         Number (fils)          owed by the customer
+  dueDate         Date
+  approvedBy      ObjectId | null
+  approvedAt      Date | null
+
+  RULE: `balance` is NEVER written directly by a route. It is recomputed
+  inside the same transaction that appends a ledger entry (§13.2). This is
+  the fix for the CRITICAL "Credit balance" item in CMS-SCOPE §2, where the
+  device writes the ledger locally.
+
+--------------------------------------------------------------------------------
+4.14 creditEntries
+--------------------------------------------------------------------------------
+  accountId       ObjectId -> creditAccounts, indexed
+  customerId      ObjectId, indexed
+  kind            String, enum: charge | payment
+  title           Localized
+  subtitle        Localized
+  amount          Number (fils)    positive charge, negative payment
+  balanceAfter    Number (fils)    running balance immediately after this row
+  orderId         ObjectId | null
+  recordedBy      ObjectId | null  admin who took the payment; null if system
+  at              Date, indexed
+
+  RULE (D7): balance = SUM of `amount` across all entries. Charges add,
+  payments subtract. `balanceAfter` on the newest entry always equals
+  `creditAccounts.balance`. The ledger is APPEND-ONLY — a mistake is
+  corrected with a compensating entry, never an edit or a delete.
+
+  DEPARTURE: v1 had a `settled: Boolean` per entry and computed the balance
+  from unsettled rows only. Dropped — it produced a balance of 203.50 on the
+  seed fixture where a straight sum gives 3.50, and it required a payment
+  allocation algorithm nobody specified. The running balance is simpler,
+  auditable and matches the build prompt's `balanceAfter`.
+
+  SEED CONSEQUENCE: the app's CREDIT_ACCOUNT fixture in src/data/orders.ts
+  must be corrected during seeding — its stated balance does not equal the
+  sum of its entries. The seed assertion in §21 will catch this.
+
+  APP CONSEQUENCE: `CreditEntry.settled` is removed from the app's type. The
+  My Credit screen's settled badge is derived instead: an entry is shown as
+  settled when `balanceAfter <= 0`.
+
+  INDEX { tenantId: 1, accountId: 1, at: -1 }
+
+--------------------------------------------------------------------------------
+4.15 promoCodes
+--------------------------------------------------------------------------------
+  code            String, uppercase, indexed    unique per tenant
+  discountType    String, enum: percent | fixed
+  value           Number            percent points, or fils
+  minSubtotal     Number (fils) | null
+  categoryIds     [ObjectId] | null             eligible categories
+  startsAt, endsAt Date | null
+  maxRedemptions  Number | null
+  perCustomerCap  Number | null
+  redemptions     Number, default 0
+  active          Boolean
+
+  INDEX { tenantId: 1, code: 1 } unique
+
+--------------------------------------------------------------------------------
+4.16 promoRedemptions
+--------------------------------------------------------------------------------
+  promoId, customerId, orderId, at
+  INDEX { tenantId: 1, promoId: 1, orderId: 1 } unique
+  INDEX { tenantId: 1, promoId: 1, customerId: 1 }     perCustomerCap
+
+  The unique index makes double redemption impossible rather than unlikely.
+
+--------------------------------------------------------------------------------
+4.17 paymentMethods
+--------------------------------------------------------------------------------
+  kind                    String, enum: card | credit | cash   CLOSED enum
+  title                   Localized
+  subtitle                Localized | null
+  requiresCreditApproval  Boolean
+  availableFor            [String]  subset of [delivery, curbside]
+  enabled                 Boolean
+  sortOrder               Number
+
+  NOTE — `availableFor` exists because the Admin's Settings screen already
+  states "Cash on delivery · Not offered for curbside". That rule had no
+  home in v1.
+
+  RULE: `kind` is a closed enum the client switches on to render bespoke UI.
+  The CMS may enable, disable, reorder and re-word methods. It may NOT create
+  a new kind — that would produce a tender the app cannot render and the
+  server cannot process.
+
+--------------------------------------------------------------------------------
+4.18 banners
+--------------------------------------------------------------------------------
+  imageUrl, linkType (category|product|none), linkId,
+  startsAt, endsAt, sortOrder, active
+
+  NOTE: replaces the three picsum.photos placeholders shipping in the app
+  today (CMS-SCOPE §2, MEDIUM).
+
+--------------------------------------------------------------------------------
+4.19 merchandising                        (single document per tenant)
+--------------------------------------------------------------------------------
+  popularProductIds   [ObjectId]     manual "Popular this week" curation
+  trendingSearches    [Localized]
+  categoryOrder       [ObjectId]
+
+--------------------------------------------------------------------------------
+4.20 contentPages
+--------------------------------------------------------------------------------
+  type      String, enum: terms | privacy | about
+  body      Localized      markdown
+  version   Number
+  publishedAt Date
+
+  NOTE: both are placeholder sentences in the app today.
+
+--------------------------------------------------------------------------------
+4.21 translationStrings
+--------------------------------------------------------------------------------
+  namespace  String, indexed     25 namespaces exist in the app
+  key        String
+  value      Localized
+  INDEX { tenantId: 1, namespace: 1, key: 1 } unique
+
+  Serves CMS-SCOPE module 11, including the translation coverage report —
+  a query for rows where `value.ar` is empty.
+
+--------------------------------------------------------------------------------
+4.22 importBatches
+--------------------------------------------------------------------------------
+  fileUrl, originalName, uploadedBy, uploadedAt
+  status          String, enum: uploaded | mapping | validating | ready |
+                                importing | done | failed
+  columnMap       Object          spreadsheet header -> model field
+  stats           { rows, created, updated, skipped, errored }
+  errors          [{ row, column, code, message }]
+  See §17.
+
+--------------------------------------------------------------------------------
+4.23 notifyRequests / searchLogs
+--------------------------------------------------------------------------------
+  notifyRequests  { customerId, variantId, createdAt, notifiedAt }
+                  back-in-stock, from the app's inert "Notify me" button
+  searchLogs      { query, resultCount, customerId, at }
+                  zero-result queries are the cheapest catalogue-gap signal
+
+--------------------------------------------------------------------------------
+4.24 auditLog
+--------------------------------------------------------------------------------
+  actorId, actorRole, action, collection, documentId,
+  changes { field: { before, after } }, ip, at
+
+  RULE: written on EVERY /admin, /delivery and /platform mutation, as a
+  changed-fields diff (not a full snapshot — products with embedded variants
+  are large). v1 audited only four fields; that is too narrow given the CMS
+  can archive products, change promo values and approve credit.
+
+--------------------------------------------------------------------------------
+4.25 dailyRollups
+--------------------------------------------------------------------------------
+  date            String (YYYY-MM-DD in tenant timezone), indexed
+  orders          { count, byStatus, byFulfillment }
+  revenue         { gross, discount, deliveryFees, net }   fils
+  topProducts     [{ productId, units, revenue }]
+  topCategories   [{ categoryId, revenue, share }]
+  newCustomers    Number
+  creditExposure  Number (fils)
+  INDEX { tenantId: 1, date: -1 } unique
+  See §18.
+
+
+================================================================================
+5. ROLES, AUTH AND PERMISSIONS
+================================================================================
+
+5.1  THE FOUR ROLES
+  superAdmin     platform level, no tenantId, operates across tenants
+  storeAdmin     tenant level, sub-graded owner|manager|staff (§5.2)
+  deliveryStaff  tenant level, sees only orders assigned to them
+  customer       tenant level, sees only their own data
+
+5.2  PERMISSION MATRIX  (storeAdmin sub-grades)
+
+  Capability                          staff   manager   owner
+  ------------------------------------------------------------
+  View order queue                      Y        Y        Y
+  Advance order status                  Y        Y        Y
+  Assign / reassign rider               Y        Y        Y
+  Toggle stock flag                     Y        Y        Y
+  Verify confirmation code              Y        Y        Y
+  Create / edit products                 -       Y        Y
+  Change prices                          -       Y        Y
+  Excel import                           -       Y        Y
+  Categories & merchandising             -       Y        Y
+  Promo codes                            -       Y        Y
+  Approve credit / set limit             -       Y        Y
+  Record credit payment                  -       Y        Y
+  Cancel order                           -       Y        Y
+  Refund                                 -        -       Y
+  Manage staff accounts                  -        -       Y
+  Tenant settings & branding             -        -       Y
+  View audit log                         -        -       Y
+
+  Implemented as `requireRole('storeAdmin', 'manager')` — the second argument
+  is the MINIMUM grade, not an exact match.
+
+5.3  CUSTOMER AUTH — PHONE + OTP
+  POST /auth/otp     { phone, channel }        → { challengeId, expiresIn }
+  POST /auth/verify  { challengeId, code }     → { accessToken, refreshToken,
+                                                    user }
+  POST /auth/refresh { refreshToken }          → new pair
+  POST /auth/logout  { refreshToken }
+
+  - Phone normalised to E.164 on write. UAE default country code.
+  - Code is 4 digits (matches the app's 4-box OTP input), argon2-hashed.
+  - Challenge expires in 5 minutes; 5 wrong attempts burns it.
+  - Resend cooldown 30 seconds — matches the countdown already in LoginScreen.
+  - OTP provider is a SWAPPABLE module: `OtpProvider` interface with
+    `send(phone, code, channel)`. Ship a console provider for dev, one SMS and
+    one WhatsApp provider for prod. Credentials may be per-tenant.
+
+  ACTION REQUIRED, LONG LEAD TIME: UAE SMS needs a registered sender ID via
+  an aggregator; WhatsApp needs a Meta BSP and a pre-approved template.
+  Both take weeks. Start the paperwork now — this one-word schema field can
+  delay launch more than any code in this document.
+
+  DEPARTURE: `signInWithProvider('google'|'apple')` exists in the app's
+  api/auth.ts and AuthContext but LoginScreen renders no buttons for it.
+  DROPPED. Social identity yields no verified phone number, and orders,
+  credit and rider handoff are all phone-keyed. It is also a trap: shipping
+  Google sign-in on iOS makes Apple sign-in mandatory under App Store 4.8.
+
+5.4  STAFF AUTH
+  POST /auth/staff/login  { email, password, tenantSlug } → token pair
+  POST /auth/platform/login { email, password, totp }     → superAdmin pair
+
+  - argon2id. 10 failed attempts locks the account for 15 minutes.
+  - superAdmin login requires TOTP. It can read every tenant's data.
+
+5.5  TOKENS
+  Access token   JWT, 60 minutes, claims { sub, role, grade, tenantId, jti }
+  Refresh token  opaque 32-byte random, stored hashed, 60 days, ROTATING
+
+  RULE — rotation with reuse detection: every refresh issues a new token and
+  marks the old one `replacedBy`. Presenting an already-rotated token means
+  it was stolen: revoke the entire `familyId` and force re-authentication.
+
+  DEPARTURE: v1 specified a 15-minute access token. Too aggressive for a
+  passwordless app — every expiry that outruns the refresh path dumps a
+  customer into an SMS flow while standing in a supermarket aisle on bad
+  signal. The security benefit is small: there is no password to protect,
+  and rotation is the real control. 60 minutes.
+
+  CLIENT STORAGE: refresh token in Expo SecureStore, access token in memory.
+  The app currently keeps a single in-memory token with no refresh path —
+  this is an app-side change.
+
+
+================================================================================
+6. THE ICON ENUM
+================================================================================
+`icon` on products and categories is not free text. It maps to a glyph in the
+app's bundled Material Symbols subset (src/components/Icon.tsx). Verified
+count: 73 names — e.g. `p-milk`, `cat-dairy`, `p-bread`.
+
+  - The backend stores the string and validates against a checked-in list.
+  - The CMS must offer a PICKLIST, never a text input.
+  - An unknown name renders as an invisible glyph, so validate on write
+    rather than discovering it in production.
+  - Excel import maps unknown icons to a category default rather than failing
+    the row.
+
+Keep the list in one shared JSON file generated from the app's GLYPHS map so
+app and server cannot drift.
+
+
+================================================================================
+7. MONEY
+================================================================================
+Store every amount as an INTEGER count of fils. 1 AED = 100 fils.
+
+WHY: the app holds prices as floats — 11, 6.5, 17.25, 4.25 — and patches the
+rounding by hand. `Math.round(x * 100) / 100` appears in CheckoutScreen,
+CartContext and OrdersContext. That works until a basket accumulates enough
+lines for the error to surface in a total a customer disputes.
+
+  AED 11.00  ->  1100
+  AED  6.50  ->   650
+  AED  4.25  ->   425
+
+The API sends fils. The app divides by 100 at the formatting boundary only,
+inside utils/format.ts, which is already the single place money becomes a
+string. Nothing else in the app changes.
+
+Currency is AED, fixed. `settings.currency` is a display constant, not a
+multi-currency switch — there is no rate table and formatMoney hardcodes both
+"AED" and "د.إ".
+
+
+================================================================================
+8. THE PRICING ENGINE
+================================================================================
+The most important module after tenant isolation, and the fix for the biggest
+CRITICAL in CMS-SCOPE §2: today CheckoutScreen computes the total and the
+device decides what it pays.
+
+  POST /cart/price
+    in   { lines: [{ variantId, quantity }], promoCode?, fulfillment,
+           addressId? }
+    out  { lines: [{ variantId, quantity, unitPrice, lineTotal,
+                     name, variantLabel, icon, stock }],
+           subtotal, deliveryFee, discount, total,
+           promo: { code, applied, reason? },
+           unavailable: [variantId],
+           priceToken }
+
+RULES
+  1. Prices are read from the database, never accepted from the client.
+  2. Out-of-stock variants are returned in `unavailable` and EXCLUDED from
+     totals, so the app can show them struck through.
+  3. Delivery fee: 0 for curbside, else tenant.settings.deliveryFee.
+  4. minOrder is checked here and reported as a reason, not a hard failure —
+     the cart must be able to explain itself.
+  5. Promo validation runs here and returns a reason on failure.
+  6. total = subtotal - discount + deliveryFee, computed in fils.
+  7. `priceToken` is a short-lived signed hash of the priced basket. The app
+     sends it back to POST /orders.
+
+CART OWNERSHIP: the cart lives on the device. CartContext persists it to
+AsyncStorage and joins lines to the catalogue on read. The server stores no
+cart and /cart/price is stateless. Consequence, stated so nobody is
+surprised: no cross-device cart and no abandoned-cart reporting.
+
+RE-PRICING AT SUBMIT
+  POST /orders takes the same shape plus `priceToken` and re-prices
+  server-side before writing. It NEVER trusts a client total.
+  - If the recomputed total differs from the token → 409 PRICE_CHANGED with
+    the corrected basket. The app re-confirms.
+  - If a line went out of stock between pricing and submit → 409
+    BASKET_CHANGED with the affected variantIds. It is NOT silently dropped:
+    charging for a different basket than the customer confirmed is the same
+    class of bug as trusting the total.
+
+
+================================================================================
+9. ORDERS
+================================================================================
+
+9.1  THE TWO CHAINS
+  Both already exist in the app (data/types.ts: DELIVERY_FLOW, PICKUP_FLOW).
+  The server owns them.
+
+    delivery:  placed -> packed -> out_for_delivery -> delivered
+    curbside:  placed -> packed -> ready_for_pickup -> customer_arrived
+                      -> handed_over
+
+  Status spellings inside the curbside chain keep the app's existing names
+  (`ready_for_pickup`), even though the fulfillment type is now `curbside`.
+  Renaming the statuses too would be churn for nothing.
+
+9.2  RULES
+  - Only forward transitions along the order's OWN chain. Anything else is
+    409 INVALID_TRANSITION — including a delivery status on a curbside order.
+  - `cancelled` is reachable from `placed` or `packed` only.
+  - `customer_arrived` is the one transition a CUSTOMER may trigger
+    (POST /orders/:id/arrived). Everything else is staff-only.
+  - `handed_over` requires `customer_arrived` first. The store cannot hand an
+    order to someone who has not said they are there. The app encodes this
+    client-side today; it moves here.
+  - `delivered` and `handed_over` both require the confirmation code
+    (§9.4).
+  - Every transition appends to `events` with a timestamp and the acting
+    user, emits a Socket.io event (§14) and enqueues a push (§15).
+
+9.3  EVENTS — WHAT IS STORED VS WHAT IS RENDERED
+  DEPARTURE: the app's OrderEvent types `at?: string` as "absent for
+  milestones that have not happened yet", implying the server pre-populates
+  the full chain. It does not. `events` is APPEND-ONLY and contains only what
+  actually happened. The app derives future milestones from `flowFor(...)`,
+  which already exists client-side. Server truth stays truthful.
+
+9.4  CONFIRMATION CODE AND PROOF OF DELIVERY
+  - 4-digit code, server-issued at order creation, cryptographically random.
+    CMS-SCOPE §2 flags the current Math.random generation as HIGH: this is
+    the number handed over at the door and it is currently guessable.
+  - `POST /delivery/orders/:id/confirm` requires the code and captures
+    proof: { photoUrl, geo, amountCollected }.
+  - amountCollected is mandatory when paymentKind is `cash` and must equal
+    the order total, else 409 AMOUNT_MISMATCH.
+
+9.5  AUTOMATIC RIDER ASSIGNMENT
+  Runs on creation of a `delivery` order.
+
+  Selection: among users where role=deliveryStaff, status=active,
+  availability=available, pick the one with the fewest `activeOrderIds`;
+  tie-break on lowest `stats.avgMinutes`.
+
+  Offer and timeout:
+    1. Assign, set availability=on_delivery, push to the rider, record
+       `assignment.assignedAt` and increment `attempts`.
+    2. Enqueue a BullMQ delayed job for ACCEPT_TIMEOUT (default 120s).
+    3. If the rider has not accepted when it fires, release them, add them to
+       `assignment.lastOfferedTo`, and reassign to the next candidate.
+    4. After 3 failed attempts, leave the order unassigned and raise it in
+       the CMS queue for manual assignment. Never loop forever.
+
+  RULE: assignment is a transaction (§13.5). Two concurrent orders must not
+  both grab the same idle rider.
+
+9.6  OVERSELL AND SUBSTITUTION  — the consequence of D8
+  Stock is a manual flag with no quantity, so two customers CAN both buy the
+  last unit and nothing can prevent it. There is no POS to read real counts
+  from. This is accepted, not solved — but it must be handled at pick time,
+  which v1 had no path for.
+
+  At packing, staff may per line:
+    - reduce `fulfilledQty` (short pick)
+    - mark a line unavailable (`fulfilledQty = 0`)
+    - substitute (`substitutedFor` points at the original line)
+
+  On leaving `packed`, the order total is RECOMPUTED from fulfilled
+  quantities:
+    - card / cash → adjusted total; the difference is refunded or simply not
+      collected
+    - credit → a compensating creditEntry for the difference, in the same
+      transaction
+    - the customer receives a push and the receipt shows original vs
+      fulfilled
+
+  RULE: the original `lines` are never rewritten. `quantity` is what was
+  ordered; `fulfilledQty` is what was picked. The receipt shows both.
+
+9.7  CANCELLATION AND REFUNDS
+  - A CUSTOMER may cancel only while status is `placed`.
+  - A manager may cancel while `placed` or `packed`.
+  - Cancelling a credit order writes a compensating ledger entry in the SAME
+    transaction as the status change. The original entry is never touched.
+  - Refunds (owner only) are recorded, not executed — there is no gateway
+    in v1 (D12). A refund writes an audit row and, for credit orders, a
+    ledger entry.
+
+9.8  REFERENCES
+  `FC-####`, server-issued, unique per tenant. This format wins because the
+  app's fixtures and credit entry titles already use it. The Admin's bare
+  numeric ids (`10486`) are display placeholders and adapt.
+
+
+================================================================================
+10. THE ROUTE TABLE
+================================================================================
+The single largest omission in v1, which specified two endpoints. Base path
+`/api/v1`. Auth column: P=public, C=customer, D=deliveryStaff,
+S=storeAdmin(grade), X=superAdmin.
+
+AUTH                                                                   AUTH
+  POST   /auth/otp                          request an OTP               P
+  POST   /auth/verify                       verify, issue tokens         P
+  POST   /auth/refresh                      rotate token pair            P
+  POST   /auth/logout                       revoke refresh token         C
+  POST   /auth/staff/login                                               P
+  POST   /auth/platform/login                                            P
+  GET    /me                                                             C
+  PATCH  /me                                name, language               C
+  POST   /me/push-token                     register Expo push token     C
+
+CATALOG (customer)
+  GET    /config                            tenant branding, fees, flags P
+  GET    /categories                                                     P
+  GET    /categories/:idOrSlug/products                                  P
+  GET    /products            ?category=&sub=&sort=&minPrice=&maxPrice=  P
+  GET    /products/:id                                                   P
+  GET    /search             ?q=                                         P
+  GET    /home                              banners, popular, trending   P
+  POST   /notify-requests                   back-in-stock                C
+
+CART, PROMOS, ORDERS
+  POST   /cart/price                                                     C
+  POST   /promo/validate                                                 C
+  POST   /orders                            Idempotency-Key required     C
+  GET    /orders                            cursor paginated             C
+  GET    /orders/:id                                                     C
+  GET    /orders/:id/receipt                                             C
+  POST   /orders/:id/arrived                curbside only                C
+  POST   /orders/:id/cancel                 only while `placed`          C
+
+ADDRESSES
+  GET    /addresses                                                      C
+  POST   /addresses                                                      C
+  PATCH  /addresses/:id                                                  C
+  DELETE /addresses/:id                                                  C
+
+CREDIT (customer)
+  GET    /credit                            limit, balance, dueDate      C
+  GET    /credit/entries                    cursor paginated             C
+
+CONTENT
+  GET    /legal/:type                       terms | privacy              P
+  GET    /strings/:lang                                                  P
+
+DELIVERY STAFF APP                                            /delivery/*
+  GET    /delivery/orders                   assigned to me               D
+  POST   /delivery/orders/:id/accept                                     D
+  POST   /delivery/orders/:id/status                                     D
+  POST   /delivery/orders/:id/confirm       code + photo + gps + cash    D
+  PATCH  /delivery/me/availability                                       D
+  GET    /delivery/me/summary               today's completed, avg time  D
+
+STORE ADMIN                                                      /admin/*
+  GET    /admin/orders          ?status=&fulfillment=&q=  cursor         S staff
+  GET    /admin/orders/:id                                               S staff
+  PATCH  /admin/orders/:id/status                                        S staff
+  POST   /admin/orders/:id/verify-code                                   S staff
+  POST   /admin/orders/:id/rider            manual assign / reassign     S staff
+  PATCH  /admin/orders/:id/lines            short pick / substitute §9.6 S staff
+  POST   /admin/orders/:id/cancel                                        S manager
+  POST   /admin/orders/:id/refund                                        S owner
+  GET    /admin/curbside/queue              arrival queue + bays         S staff
+  PATCH  /admin/curbside/orders/:id/bay                                  S staff
+
+  CRUD   /admin/categories                                               S manager
+  CRUD   /admin/products                                                 S manager
+  PATCH  /admin/variants/:id/stock          the QuickStock toggle        S staff
+  GET    /admin/variants/by-barcode/:code   barcode scan lookup          S staff
+  POST   /admin/import/upload               → importBatch                S manager
+  GET    /admin/import/:id                  status, errors, preview      S manager
+  POST   /admin/import/:id/mapping          column map                   S manager
+  POST   /admin/import/:id/commit                                        S manager
+  GET    /admin/products/needs-fixing       uncategorised / untranslated S manager
+
+  CRUD   /admin/promos                                                   S manager
+  CRUD   /admin/banners                                                  S manager
+  PUT    /admin/merchandising               popular, trending, order     S manager
+  CRUD   /admin/staff                       storeAdmin + deliveryStaff   S owner
+
+  GET    /admin/customers                   search, paginated            S manager
+  GET    /admin/customers/:id                                            S manager
+  PATCH  /admin/customers/:id/credit        approve, set limit           S manager
+  PATCH  /admin/customers/:id/block                                      S manager
+  GET    /admin/credit                      exposure, overdue list       S manager
+  GET    /admin/credit/:customerId/entries                               S manager
+  POST   /admin/credit/:customerId/payment  record a settlement          S manager
+
+  GET    /admin/analytics/today             orders, revenue, live        S staff
+  GET    /admin/analytics/summary  ?from=&to=                            S manager
+  GET    /admin/analytics/products          best sellers                 S manager
+  GET    /admin/analytics/customers         RFM top customers            S manager
+  GET    /admin/analytics/categories        category performance         S manager
+  GET    /admin/analytics/search-gaps       zero-result queries          S manager
+
+  GET    /admin/config                                                   S owner
+  PUT    /admin/config                      fees, hours, flags, branding S owner
+  CRUD   /admin/content                     legal pages                  S owner
+  CRUD   /admin/strings                     translations                 S owner
+  GET    /admin/strings/coverage            missing-Arabic report        S owner
+  GET    /admin/audit                       cursor paginated             S owner
+
+SUPER ADMIN                                                   /platform/*
+  GET    /platform/tenants                                               X
+  POST   /platform/tenants                  onboard                      X
+  GET    /platform/tenants/:id                                           X
+  PATCH  /platform/tenants/:id              configure, branding, plan    X
+  POST   /platform/tenants/:id/suspend                                   X
+  POST   /platform/tenants/:id/reactivate                                X
+  POST   /platform/tenants/:id/impersonate  scoped token + audit row     X
+  CRUD   /platform/plans                                                 X
+  GET    /platform/invoices                 filter by tenant, status     X
+  POST   /platform/invoices/:id/issue                                    X
+  POST   /platform/invoices/:id/mark-paid   manual in v1 (D14)           X
+  GET    /platform/analytics                cross-tenant                 X
+  CRUD   /platform/users                    other super admins           X
+
+OPS
+  GET    /health                            liveness                     P
+  GET    /ready                             mongo + redis reachable      P
+
+  RULE: `/platform/tenants/:id/impersonate` issues a normal storeAdmin token
+  scoped to that tenant, with an `imp` claim naming the super admin. Every
+  action it takes writes an audit row attributing BOTH identities. Support
+  will need this on day one; building it later means retrofitting audit.
+
+
+================================================================================
+11. ERRORS
+================================================================================
+One shape everywhere (D9):
+
+  { "error": { "code": "PROMO_EXPIRED",
+               "message": "This promo code has expired.",
+               "details": { },
+               "requestId": "01J..." } }
+
+  400 VALIDATION_FAILED        zod rejected the body
+  401 UNAUTHENTICATED          missing or expired token
+  401 TOKEN_REUSED             rotated refresh token replayed (§5.5)
+  403 FORBIDDEN                wrong role or grade
+  403 TENANT_MISMATCH          token and header disagree (§1.2)
+  403 TENANT_SUSPENDED         tenant status is suspended
+  404 NOT_FOUND
+  409 INVALID_TRANSITION       bad order status move
+  409 PRICE_CHANGED            stale total at submit
+  409 BASKET_CHANGED           a line went out of stock at submit
+  409 AMOUNT_MISMATCH          cash collected != total
+  409 PROMO_LIMIT_REACHED
+  409 CREDIT_LIMIT_EXCEEDED
+  422 MIN_ORDER_NOT_MET
+  429 RATE_LIMITED
+  500 INTERNAL
+
+  `code` is stable and machine-readable; the app maps it to a translated
+  string. `message` is English, for logs and the CMS — never render it to a
+  customer, it is not localised.
+
+  APP CHANGE REQUIRED: api/client.ts currently reads `body.message` and
+  `body.code` at the TOP level. Under this envelope every error would surface
+  as `undefined`. Three lines, but it is the first thing every integration
+  hits.
+
+  ERROR CODE REGISTRY: the full list lives in one shared JSON file alongside
+  the icon list, because the app cannot invent codes at runtime.
+
+
+================================================================================
+12. PAGINATION
+================================================================================
+  Offset  — admin tables where a human wants page numbers.
+            `?page=1&limit=20` → { items, page, limit, total }
+  Cursor  — customer order list, credit ledger, admin order queue, audit log.
+            `?cursor=<opaque>&limit=20` → { items, nextCursor }
+
+  DEPARTURE: v1 put `total` on every list. That is a countDocuments on
+  `orders` per poll of the live queue, on a collection that only grows — and
+  offset pagination duplicates and skips rows on a queue whose members change
+  status between page fetches. Cursor where the data moves.
+
+  Cursor encoding: base64 of `{ sortValue, _id }`, always with `_id` as the
+  tie-break so the sort is total.
+
+
+================================================================================
+13. TRANSACTIONS, CONCURRENCY AND IDEMPOTENCY
+================================================================================
+Every operation that must be atomic, and why. All require the replica set
+(§2). All retry on TransientTransactionError with jittered backoff, max 3.
+
+13.1  ADDRESS PRIMARY SWAP
+      Clear the previous primary and set the new one. Without this, a failure
+      between the two writes leaves zero or two primaries and the app's
+      AddressesContext breaks.
+
+13.2  CREDIT LEDGER APPEND
+      Append entry → recompute balance → write balanceAfter → update
+      creditAccounts.balance. Reading the balance and writing it back without
+      a transaction is exactly the bug CMS-SCOPE §2 calls CRITICAL.
+      Also enforces `balance + amount <= limit`, else 409
+      CREDIT_LIMIT_EXCEEDED.
+
+13.3  PLACE ORDER  — the big one
+      Inside one transaction:
+        1. Re-price the basket from the database (§8).
+        2. Validate and atomically claim the promo (13.4).
+        3. Issue reference and confirmation code.
+        4. If paymentKind is credit: append the ledger entry (13.2) and
+           check the limit.
+        5. Write the order.
+      Outside the transaction, after commit: assign rider, emit socket
+      events, enqueue pushes. Never do network I/O inside a transaction.
+
+13.4  PROMO CLAIM
+      `findOneAndUpdate` with `{ active: true, redemptions: { $lt:
+      maxRedemptions } }` in the FILTER and `$inc: { redemptions: 1 }` in the
+      update. The filter is the lock. `perCustomerCap` is a counted query on
+      promoRedemptions in the same transaction.
+
+      NOTE: the unique index on { promoId, orderId } prevents double-counting
+      one order. It does NOT prevent exceeding maxRedemptions under
+      concurrency — only the guarded $inc does.
+
+13.5  RIDER ASSIGNMENT
+      `findOneAndUpdate` on the chosen rider with
+      `{ availability: 'available' }` in the filter. If it returns null,
+      someone else took them; pick the next candidate. Prevents two orders
+      landing on one idle rider.
+
+13.6  STOCK FLAG TOGGLE
+      Not transactional. It is a single field write on one document and there
+      is deliberately no quantity to contend on (D8).
+
+13.7  IDEMPOTENCY
+      `POST /orders` REQUIRES an `Idempotency-Key` header. Without it, a
+      double-tap or a network retry creates two orders, two credit entries
+      and two promo redemptions.
+        - Key stored with the order (`orders.idempotencyKey`, unique sparse
+          per tenant) plus a Redis lock for the in-flight window.
+        - A repeat with the same key returns the ORIGINAL order, 200 not 201.
+        - TTL 24 hours.
+      Also applied to POST /admin/credit/:id/payment and
+      POST /delivery/orders/:id/confirm.
+
+
+================================================================================
+14. REALTIME (Socket.io)
+================================================================================
+  Namespace per tenant: `/t/<tenantId>`. Joining requires a valid JWT whose
+  tenantId matches the namespace — the SAME check as HTTP, because a socket
+  is an authenticated channel and leaks the same data.
+
+  Rooms
+    order:<orderId>     the customer tracking that order
+    queue               store admins watching the live order queue
+    rider:<userId>      one delivery staff member
+
+  Events (server → client)
+    order.created       → queue
+    order.status        → queue, order:<id>, rider:<id>
+    order.assigned      → queue, rider:<id>
+    order.arrived       → queue                     curbside "I'm here"
+    order.lines         → queue, order:<id>         short pick / substitution
+    rider.location      → order:<id>                 v2, when GPS streams
+    stock.changed       → queue
+
+  RULE: sockets carry NOTIFICATIONS, never authority. A client that misses an
+  event must reach the same state by re-fetching. Never let a socket payload
+  be the only source of a value.
+
+  The app polls today; it moves to sockets with polling as the fallback.
+
+
+================================================================================
+15. NOTIFICATIONS
+================================================================================
+  Transport: Expo Push (D13). One API that reaches both APNs and iOS/Android
+  via FCM underneath. The build prompt said FCM direct — overruled, because
+  the customer app is an Expo app and FCM alone does not cover iOS cleanly.
+  The delivery staff PWA uses Web Push.
+
+  Tokens live on `users.pushTokens`, registered via POST /me/push-token, and
+  are pruned when Expo reports them invalid.
+
+  Triggers
+    - every order status transition          → customer
+    - order assigned / reassigned            → delivery staff
+    - customer arrived                       → store admins
+    - short pick or substitution             → customer
+    - back-in-stock                          → everyone in notifyRequests
+    - credit payment recorded, credit due    → customer
+    - invoice issued / overdue               → tenant owner
+
+  RULE: state transitions EMIT A DOMAIN EVENT. A notifier consumes it.
+  Nothing in the order module imports the push SDK. This resolves the
+  contradiction in v1, where §7 said every transition fires a push while §11
+  deferred push entirely.
+
+  All notification copy is Localized and sent in the recipient's `language`.
+
+
+================================================================================
+16. FILE UPLOAD
+================================================================================
+  v1 deferred this to "later". It cannot be: categories, products, banners,
+  tenant logos and delivery proof photos all need it on day one, and seeding
+  uploads the bundled category tiles.
+
+  Flow
+    1. POST /admin/uploads/sign { contentType, purpose } → { url, fileUrl }
+    2. Client PUTs the bytes DIRECTLY to storage.
+    3. Client sends `fileUrl` on the create/update call.
+
+  - S3-compatible storage (Cloudflare R2 recommended — free egress).
+  - Bytes never pass through Express.
+  - Presigned URL valid 5 minutes, single use.
+  - Limits: 5 MB, image/jpeg|png|webp only, enforced in the presign
+    conditions, not just checked client-side.
+  - Path: `<tenantId>/<purpose>/<uuid>.<ext>` — tenant-prefixed so storage
+    is auditable and deletable per tenant.
+  - Delivery proof photos are PRIVATE: served via short-lived signed GET,
+    never a public URL. They contain a customer's doorstep.
+
+
+================================================================================
+17. EXCEL IMPORT
+================================================================================
+The store admin's primary catalogue tool. There is no POS integration, so
+this and the manual stock toggle are the only ways stock and prices change.
+
+  1. UPLOAD      xlsx/csv to storage (§16), create an importBatch.
+  2. PARSE       read headers + first 20 rows, return them for mapping.
+  3. MAP         admin maps spreadsheet columns → model fields. The map is
+                 SAVED on the tenant and offered as the default next time —
+                 the same shop uploads the same spreadsheet every week.
+  4. VALIDATE    dry run. Produces per-row errors with row and column
+                 numbers. Nothing is written.
+  5. COMMIT      a background job (BullMQ) writes in batches.
+
+  VARIANT GROUPING: rows sharing a `productKey` (mapped column, or matched by
+  name) collapse into one product with many variants. The axis is inferred
+  from a mapped attribute column (flavour, size). This is the fiddliest part
+  of the module and deserves its own test fixtures.
+
+  CATEGORY CLEANUP: fuzzy-match the category text against existing category
+  names in BOTH languages. No confident match → the product lands
+  uncategorised with `status: draft` and appears in
+  GET /admin/products/needs-fixing. Import never invents categories.
+
+  MATCHING for update-vs-create: barcode first, then (name + variant label).
+  Barcode is the only reliable key.
+
+  RULES
+    - Import writes DRAFTS. Nothing reaches customers until published.
+    - A row that fails validation is skipped and reported; it never aborts
+      the batch.
+    - Import respects plan limits (§19.2) and fails the batch early if the
+      product cap would be exceeded.
+    - Every import writes one audit row with the batch stats, not one per
+      product.
+
+
+================================================================================
+18. ANALYTICS
+================================================================================
+Absent entirely from v1, but the Admin's Insights screen already renders best
+sellers, category performance, top customers, an orders sparkline and revenue
+totals — and the build prompt adds RFM and seasonal flags.
+
+  STRATEGY: precomputed rollups, not live aggregation over `orders`.
+
+  - A nightly job per tenant writes one `dailyRollups` document for the
+    previous day, bucketed in the TENANT's timezone.
+  - Historical queries read rollups. Fast, and cost is independent of order
+    volume.
+  - "Today" is the ONLY live aggregation — a small, bounded window.
+  - Backfill job to build rollups from existing orders when a tenant onboards
+    with history.
+
+  RFM top customers: recency (days since last order), frequency (orders in
+  window), monetary (net revenue). Scored 1-5 per axis on tenant-relative
+  quintiles, recomputed weekly, cached on a `customerScores` view.
+
+  Seasonal trend flags: compare a product's trailing 4-week units against the
+  same weeks last year. Needs a year of data — ship the field, expect it to
+  be null until then. Do not fake it.
+
+  Cross-tenant platform analytics (§19) reads the same rollups, summed. This
+  is the reason rollups are a collection rather than a cache.
+
+
+================================================================================
+19. PLATFORM / SUPER ADMIN
+================================================================================
+
+19.1  TENANT ONBOARDING
+  POST /platform/tenants creates the tenant, its owner storeAdmin user, a
+  default paymentMethods set, a default merchandising document and the
+  seeded car colour list — in ONE transaction. A half-created tenant is
+  unusable and nobody will notice until the owner tries to log in.
+
+19.2  PLAN LIMITS
+  Enforced at write time, checked in middleware:
+    products         blocks create and Excel commit
+    ordersPerMonth   soft — warns the owner, never blocks a customer's order
+    staffSeats       blocks staff creation
+
+  RULE: never block an ORDER because of a billing limit. Blocking revenue to
+  enforce a subscription tier turns a billing problem into a customer-facing
+  outage. Warn the owner, invoice the overage.
+
+19.3  BILLING (D14 — real invoicing)
+  - Monthly job, per tenant, on the tenant's billing anchor date.
+  - Generates an invoice: plan fee + any overage lines, 5% UAE VAT, sequential
+    per-year numbering, due 14 days.
+  - Status: draft → issued → paid | overdue | void.
+  - PAYMENT COLLECTION IS MANUAL IN v1. There is no gateway (D12); an owner
+    or super admin marks an invoice paid with a reference. When the gateway
+    lands, only the collection step changes — the invoice model does not.
+  - Overdue past a grace period flags the tenant for review. Suspension is a
+    DELIBERATE human action, never automatic — an automatic suspension takes
+    a supermarket offline mid-trading-day.
+
+19.4  SUSPENSION SEMANTICS
+  A suspended tenant:
+    - customer app → 403 TENANT_SUSPENDED on every route
+    - store admin  → read-only, plus the billing screen
+    - EXISTING OPEN ORDERS STILL COMPLETE. Orders already placed must reach
+      delivery or handover. Never strand a paid basket over a billing dispute.
+
+
+================================================================================
+20. SEARCH AND LOCALISATION
+================================================================================
+
+20.1  SEARCH
+  DEPARTURE: v1 specified a MongoDB text index over name.en, name.ar,
+  subtitle.en, subtitle.ar. Two problems. A text index applies ONE language
+  per document, so indexing both languages in one index is already a
+  compromise; and Arabic stemming is not part of MongoDB Community's text
+  search language set — it belongs to the Enterprise/Atlas feature set, so on
+  Community, Arabic degrades to simple tokenisation with no stemming.
+  VERIFY THIS against whichever tier you deploy on before relying on it.
+
+  v1 approach instead: a `searchTokens: [String]` array we control.
+    - lowercase, strip Arabic diacritics, normalise alef/ya/ta-marbuta
+      variants, strip punctuation
+    - tokens from name, subtitle and barcode, both languages
+    - plain multikey index — predictable, tier-independent, works for prefix
+      matching with a regex anchored at ^
+  Move to Atlas Search when catalogue size justifies it.
+
+  Every query, including zero-result ones, writes a searchLog. Zero-result
+  queries are the cheapest catalogue-gap signal available.
+
+20.2  LANGUAGE
+  - `Accept-Language` picks a default but the API RETURNS BOTH languages on
+    every Localized field. The app switches without a refetch.
+  - Notifications and emails use the recipient's stored `language`.
+  - Translation coverage report: rows where `value.ar` is empty. CMS-SCOPE
+    module 11 requires a missing Arabic value to be visible BEFORE release.
+
+20.3  TIME
+  - All instants stored UTC.
+  - Every date boundary — "today's orders", rollup buckets, credit dueDate,
+    overdue, opening hours, invoice periods — uses `tenant.locale.timezone`,
+    default `Asia/Dubai`. Bucketing in UTC puts a 4am Dubai order on the
+    previous day.
+
+20.4  PHONE
+  E.164 normalisation on write, UAE default region. `+971 50 214 8873`,
+  `050 214 8873` and `971502148873` are one customer.
+
+
+================================================================================
+21. SEEDING
+================================================================================
+The app's mock data is a complete, coherent fixture set. Import it rather
+than inventing new data. Seeds ONE demo tenant.
+
+  src/data/mock.ts     CATEGORIES, PRODUCTS, PROMO_CODES, DELIVERY_FEE,
+                       DELIVERY_ETA_MINUTES, LAST_BASKET, DEFAULT_ADDRESS
+  src/data/orders.ts   ADDRESSES, PAYMENT_METHODS, PICKUP_STORES,
+                       DEFAULT_CAR, CAR_COLOURS (11), PAST_ORDERS,
+                       ACTIVE_ORDER, CREDIT_ACCOUNT
+
+  Conversions on the way in:
+    - every price float → fils (11 → 1100, 6.5 → 650, 17.25 → 1725)
+    - category `id: 'fruits-veg'` → ObjectId, with `slug: 'fruits-veg'`
+    - PICKUP_STORES[0] → tenant.store (D2)
+    - category tile artwork uploaded to storage, URLs written to
+      categories.imageUrl
+    - CREDIT_ACCOUNT entries recomputed with running balanceAfter
+
+  ASSERTIONS the seed script must run and fail loudly on:
+    1. every order: sum(line.unitPrice * quantity) == subtotal
+    2. every order: subtotal - discount + deliveryFee == total
+    3. credit: balance == sum(entries.amount), and the newest entry's
+       balanceAfter == balance
+    4. every Localized field on a published document has non-empty en AND ar
+    5. every `icon` value exists in the shared icon list
+    6. no document lacks a tenantId
+
+  WARNING on assertion 3: the app's CREDIT_ACCOUNT states balance 203.50
+  while its entries sum to 3.50 (a -200 payment is excluded). Under D7 the
+  entries are authoritative — the seed must CORRECT the balance, not the
+  entries. Do not "fix" this by reintroducing the settled flag.
+
+
+================================================================================
+22. RATE LIMITING
+================================================================================
+  POST /auth/otp          1 per 30s per phone (matches the app's countdown),
+                          5 per hour per phone, 20 per hour per IP
+  POST /auth/verify       5 attempts per challenge, then the challenge burns
+  staff / platform login  10 per 15 min per email, then 15-minute lock
+  POST /orders            10 per minute per customer
+  POST /cart/price        60 per minute per customer
+  general authenticated   300 per minute per user
+  general public          100 per minute per IP
+
+  Keyed in Redis. Rate limit state is per tenant where the key is a tenant
+  resource, and global where the key is an IP.
+
+
+================================================================================
+23. CONFIG, OBSERVABILITY, TESTING
+================================================================================
+
+23.1  ENV  (zod-validated in config/env.ts, fails fast on boot)
+  NODE_ENV, PORT, API_BASE_PATH
+  MONGO_URI (must be a replica set), REDIS_URL
+  JWT_SECRET, JWT_ACCESS_TTL, REFRESH_TTL_DAYS
+  ARGON2_MEMORY_KB, ARGON2_TIME_COST
+  S3_ENDPOINT, S3_BUCKET, S3_KEY, S3_SECRET, S3_PUBLIC_BASE
+  OTP_PROVIDER, OTP_API_KEY, OTP_SENDER_ID, WHATSAPP_BSP_KEY
+  EXPO_ACCESS_TOKEN
+  ENCRYPTION_KEY            envelope key for tenant gateway credentials
+  DEFAULT_TIMEZONE=Asia/Dubai
+  PLATFORM_ORIGIN, ADMIN_ORIGIN_PATTERN     CORS
+
+23.2  OBSERVABILITY
+  - pino, one line per request, always carrying requestId, tenantId, userId,
+    role, route, status, duration.
+  - requestId from `X-Request-Id` or generated; returned in the error
+    envelope and in every response header.
+  - GET /health (liveness) and GET /ready (mongo + redis reachable).
+  - Alert on: tenant isolation plugin throwing, transaction retry exhaustion,
+    rider assignment reaching 3 attempts, OTP send failures, import job
+    failures.
+
+23.3  TESTING
+  - vitest + mongodb-memory-server IN REPLICA-SET MODE, or every transaction
+    test fails.
+  - The tenant isolation suite of §1.6 is mandatory and gates merges.
+  - Pricing engine: table-driven fixtures over promos, min order,
+    unavailable lines, curbside vs delivery.
+  - State machine: exhaustive — every (fulfillment, from, to) pair asserted
+    allowed or 409.
+  - Credit: property test that balance always equals the sum of entries after
+    any sequence of appends.
+  - Concurrency: two simultaneous orders on a promo with maxRedemptions=1;
+    two simultaneous orders competing for one idle rider.
+
+
+================================================================================
+24. BUILD ORDER
+================================================================================
+Each phase is releasable and unblocks the next.
+
+  PHASE 0  TENANT FOUNDATION
+    Tenant model, tenantContext middleware, the Mongoose isolation plugin,
+    the isolation test suite, env config, error envelope, health checks.
+    Nothing else starts until the plugin is proven.
+
+  PHASE 1  IDENTITY
+    OTP auth with a swappable provider, refresh rotation, staff and platform
+    login, roles and the permission matrix, /config, tenant onboarding.
+    Why first: every module needs a trustworthy caller and a place to read
+    fees and flags from.
+
+  PHASE 2  CATALOG AND MEDIA
+    Categories, products, variant matrix, stock flags, upload, search tokens,
+    Excel import. Ship api/catalog.ts in the app against the existing client
+    wrapper.
+    Why here: turns five app screens from static to live. The biggest lift.
+
+  PHASE 3  PRICING AND ORDERS
+    Pricing engine, promo validation, order creation with server-issued
+    reference and confirmation code, both status chains, rider assignment,
+    idempotency.
+    Why here: closes all four CMS-SCOPE security blockers.
+
+  PHASE 4  CUSTOMERS, ADDRESSES, CREDIT
+    Address book with the primary invariant, credit approval, the ledger,
+    statements, overdue reporting.
+    Why here: the ledger is written from real orders, so orders come first.
+
+  PHASE 5  DELIVERY STAFF AND CURBSIDE
+    Delivery app endpoints, proof of delivery, availability, arrival queue,
+    bays, car profiles.
+    Why here: improves an experience that already works end to end.
+
+  PHASE 6  REALTIME, NOTIFICATIONS, MERCHANDISING
+    Socket.io, Expo push, banners, popular and trending, legal pages,
+    translation strings.
+
+  PHASE 7  ANALYTICS AND PLATFORM
+    Rollups, the Insights endpoints, RFM, super admin portal, plans,
+    invoicing.
+    Why last: analytics need real traffic to be worth anything, and billing
+    needs tenants who have been live long enough to bill.
+
+
+================================================================================
+25. STILL OPEN
+================================================================================
+Small, and none of them block Phase 0.
+
+  1. CONFIRM A1 — one app build per supermarket (white-label), tenant baked
+     into config? The alternative is a store-picker on first launch. This
+     changes app distribution, not the backend, but it should be written
+     down.
+
+  2. Delivery slots are dropped (D6). Confirmed only that the CODE is dead —
+     confirm the BUSINESS does not want scheduled delivery windows within the
+     next two quarters. Re-adding later is a cheap migration; building around
+     a phantom feature is not.
+
+  3. `curbside` vs `pickup` on the wire (A3). Going with `curbside`. Costs a
+     small rename in the app's FulfillmentType.
+
+  4. Does delivery staff need live GPS streaming, or is a location captured
+     at delivery enough? v1 assumes the latter. Streaming is a v2 socket
+     event, already stubbed in §14.
+
+  5. Tenant billing anchor: calendar month, or the tenant's signup date?
+     Assumed signup date.
+
+  6. Data retention: how long are delivery proof photos kept? They are
+     private customer doorsteps. Assumed 90 days, then purged.
+
+
+================================================================================
+END
+================================================================================
