@@ -100,7 +100,13 @@ export function tenantScopePlugin(schema: Schema): void {
     this.pipeline().unshift({ $match: { tenantId } });
   });
 
-  schema.pre('save', function (this: Document & { tenantId?: unknown }) {
+  // MUST be 'validate', not 'save': Mongoose runs schema validation (which
+  // includes the `required: true` check on tenantId) during the 'validate'
+  // phase, and that phase completes — and can already fail — before any
+  // 'save' pre-hook runs. Stamping tenantId in pre('save') was too late for
+  // every model whose tenantId is `required: true`; it silently worked only
+  // for the write paths that happened to pass tenantId explicitly.
+  schema.pre('validate', function (this: Document & { tenantId?: unknown }) {
     if (this.isNew && !this.tenantId) {
       const ctx = getContext();
       if (!ctx?.tenantId) {

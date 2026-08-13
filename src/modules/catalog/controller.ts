@@ -20,6 +20,13 @@ export const listProductsQuery = paginationQuery.extend({
 
 export const searchQuery = paginationQuery.extend({ q: z.string().min(1) });
 
+export const adminListProductsQuery = paginationQuery.extend({
+  q: z.string().optional(),
+  category: z.string().optional(),
+  status: z.enum(['draft', 'published']).optional(),
+  includeArchived: z.coerce.boolean().optional(),
+});
+
 export const productBodySchema = z.object({
   categoryId: z.string().nullable().optional(),
   subcategoryId: z.string().nullable().optional(),
@@ -41,6 +48,7 @@ export const productBodySchema = z.object({
   variants: z.array(
     z.object({
       optionIds: z.record(z.string()).optional(),
+      label: localizedSchema.nullable().optional(),
       price: z.number().int().min(0),
       compareAtPrice: z.number().int().nullable().optional(),
       barcode: z.string().nullable().optional(),
@@ -91,6 +99,18 @@ export async function getProduct(req: Request, res: Response): Promise<void> {
 export async function search(req: Request, res: Response): Promise<void> {
   const { q, ...pagination } = searchQuery.parse(req.query);
   res.json(await service.search(q, req.ctx.userId ? String(req.ctx.userId) : null, pagination));
+}
+
+export async function adminListProducts(req: Request, res: Response): Promise<void> {
+  res.json(await service.adminListProducts(adminListProductsQuery.parse(req.query)));
+}
+
+export async function adminListCategories(_req: Request, res: Response): Promise<void> {
+  res.json(await service.adminListCategories());
+}
+
+export async function adminGetProduct(req: Request, res: Response): Promise<void> {
+  res.json(await service.adminGetProduct(req.params.id!));
 }
 
 // --------------------------------------------------------------------- admin

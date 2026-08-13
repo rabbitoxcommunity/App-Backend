@@ -48,6 +48,12 @@ apiRouter.use('/credit', creditRouter);
 apiRouter.use('/admin/customers', adminCustomersRouter);
 apiRouter.use('/admin/credit', adminCreditRouter);
 
+// Admin gap fill — staff accounts and payment method management (Admin dashboard integration)
+import { adminStaffRouter } from '../modules/staff/admin.routes.js';
+import { adminPaymentMethodsRouter } from '../modules/paymentMethods/admin.routes.js';
+apiRouter.use('/admin/staff', adminStaffRouter);
+apiRouter.use('/admin/payment-methods', adminPaymentMethodsRouter);
+
 // Phase 5 — delivery staff + curbside
 import { deliveryRouter } from '../modules/delivery/routes.js';
 import { adminCurbsideRouter } from '../modules/curbside/admin.routes.js';

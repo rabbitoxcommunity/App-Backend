@@ -3,6 +3,7 @@ import { Order } from '../../models/Order.js';
 import { DailyRollup } from '../../models/DailyRollup.js';
 import { SearchLog } from '../../models/SearchLog.js';
 import { Tenant } from '../../models/Tenant.js';
+import { User } from '../../models/User.js';
 import { todayKey, startOfDayInTimezone } from '../../lib/timezone.js';
 
 /** §18 — the ONLY live aggregation; everything historical reads dailyRollups. */
@@ -107,7 +108,7 @@ export async function rfmCustomers(tenantId: Types.ObjectId) {
   const frequencies = rows.map((r) => r.frequency);
   const monetaries = rows.map((r) => r.monetary);
 
-  return rows
+  const scored = rows
     .map((r) => ({
       ...r,
       rScore: quintile(recencies, r.recencyDays, true), // fewer days since = better = invert
@@ -116,6 +117,11 @@ export async function rfmCustomers(tenantId: Types.ObjectId) {
     }))
     .sort((a, b) => b.mScore + b.fScore + b.rScore - (a.mScore + a.fScore + a.rScore))
     .slice(0, 50);
+
+  // ADMIN GAP FILL — Insights' "top customers" cards need a name to show.
+  const customers = await User.find({ _id: { $in: scored.map((r) => r.customerId) } }, { name: 1, phone: 1 });
+  const byId = new Map(customers.map((c) => [String(c._id), { name: c.name, phone: c.phone }]));
+  return scored.map((r) => ({ ...r, customer: byId.get(r.customerId) ?? null }));
 }
 
 /** §14 STAFF & REPORTING — zero-result queries are the cheapest catalogue-gap signal. */

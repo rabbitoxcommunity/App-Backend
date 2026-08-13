@@ -186,12 +186,28 @@ async function uniqueReference(
 
 // ---------------------------------------------------------------- reads
 
+/**
+ * ADMIN GAP FILL — the CMS order screens (live queue, history, drawer) need
+ * the customer's name and phone prominently, but Order only stores
+ * customerId. Batch-join rather than N+1: one User query per page of orders.
+ */
+async function withCustomerInfo<T extends { customerId: Types.ObjectId }>(
+  orders: T[],
+): Promise<Array<T & { customer: { name: string; phone: string } | null }>> {
+  if (orders.length === 0) return [];
+  const ids = [...new Set(orders.map((o) => String(o.customerId)))];
+  const customers = await User.find({ _id: { $in: ids } }, { name: 1, phone: 1 });
+  const byId = new Map(customers.map((c) => [String(c._id), { name: c.name, phone: c.phone }]));
+  return orders.map((o) => ({ ...o, customer: byId.get(String(o.customerId)) ?? null }));
+}
+
 export async function getOrder(tenantId: Types.ObjectId, orderId: string, customerId?: Types.ObjectId) {
   const filter: Record<string, unknown> = { _id: orderId, tenantId };
   if (customerId) filter.customerId = customerId;
   const order = await Order.findOne(filter);
   if (!order) throw AppError.notFound('Order');
-  return order;
+  const [withCustomer] = await withCustomerInfo([order.toJSON() as unknown as { customerId: Types.ObjectId }]);
+  return withCustomer;
 }
 
 export async function listCustomerOrders(
@@ -229,8 +245,11 @@ export async function listAdminOrders(
   const hasMore = items.length > opts.limit;
   const page = items.slice(0, opts.limit);
   const last = page[page.length - 1];
+  const withCustomers = await withCustomerInfo(
+    page.map((o) => o.toJSON() as unknown as { customerId: Types.ObjectId }),
+  );
   return {
-    items: page,
+    items: withCustomers,
     nextCursor: hasMore && last ? encodeCursor(last.placedAt.getTime(), String(last._id)) : null,
   };
 }

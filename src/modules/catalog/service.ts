@@ -126,6 +126,7 @@ export type ProductInput = {
   axes?: Array<{ slug: string; name: Localized; options: Array<{ slug: string; name: Localized }> }>;
   variants: Array<{
     optionIds?: Record<string, string>;
+    label?: Localized | null; // manual variant label when no formal axis applies
     price: number;
     compareAtPrice?: number | null;
     barcode?: string | null;
@@ -134,6 +135,55 @@ export type ProductInput = {
   }>;
   status?: 'draft' | 'published';
 };
+
+/**
+ * ADMIN GAP FILL — the CMS product list needs to see drafts, archived and
+ * out-of-stock items too (not just what the customer app shows), search by
+ * name/barcode, and filter by status/category. Public listProducts()
+ * deliberately excludes all of that.
+ */
+export async function adminListProducts(opts: {
+  page: number;
+  limit: number;
+  q?: string;
+  category?: string;
+  status?: 'draft' | 'published';
+  includeArchived?: boolean;
+}) {
+  const filter: FilterQuery<typeof Product> = {};
+  if (!opts.includeArchived) filter.archivedAt = null;
+  if (opts.status) filter.status = opts.status;
+  if (opts.category) {
+    filter.categoryId = opts.category === 'none' ? null : opts.category;
+  }
+  if (opts.q) {
+    const tokens = buildSearchTokens([opts.q]);
+    filter.$or = [
+      { searchTokens: { $in: tokens.map((t) => new RegExp(`^${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`)) } },
+      { 'variants.barcode': opts.q },
+    ];
+  }
+
+  const skip = (opts.page - 1) * opts.limit;
+  const [items, total] = await Promise.all([
+    Product.find(filter).sort({ createdAt: -1 }).skip(skip).limit(opts.limit),
+    Product.countDocuments(filter),
+  ]);
+  return { items, page: opts.page, limit: opts.limit, total };
+}
+
+/** ADMIN GAP FILL — admin category management needs drafts and hidden rows too. */
+export async function adminListCategories() {
+  return Category.find({ archivedAt: null }).sort({ sortOrder: 1 });
+}
+
+/** ADMIN GAP FILL — the edit form needs a single product regardless of status (public getProduct only returns published). */
+export async function adminGetProduct(id: string) {
+  if (!Types.ObjectId.isValid(id)) throw AppError.notFound('Product');
+  const product = await Product.findOne({ _id: id, archivedAt: null });
+  if (!product) throw AppError.notFound('Product');
+  return product;
+}
 
 function assertPublishReady(input: { name: Localized; status?: string }): void {
   if (input.status === 'published' && !isCompleteLocalized(input.name)) {

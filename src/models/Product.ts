@@ -24,6 +24,10 @@ const VariantSchema = new Schema(
   {
     // axis _id -> option _id. Map<String, ObjectId> per §4.8.
     optionIds: { type: Map, of: Schema.Types.ObjectId, default: () => new Map() },
+    // ADMIN GAP FILL — a free-text fallback for variants added by hand in the
+    // CMS without a formal axis (e.g. "250ml", "Sugarfree"). When present and
+    // optionIds is empty, this is what the order line snapshots as the label.
+    label: { type: LocalizedSchema, default: null },
     price: { type: Number, required: true, min: 0 }, // fils
     compareAtPrice: { type: Number, default: null },
     barcode: { type: String, default: null },

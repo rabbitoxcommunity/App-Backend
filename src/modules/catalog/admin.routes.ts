@@ -9,6 +9,19 @@ export const adminCatalogRouter = Router();
 
 // §5.2 permission matrix — catalogue writes need manager; stock toggle and
 // barcode lookup are staff-level (QuickStock is used on the shop floor).
+// Reads (list views) are staff-level too — viewing the catalogue isn't a
+// write, and floor staff need to see it to do their job.
+
+adminCatalogRouter.get(
+  '/categories',
+  requireRole('storeAdmin', 'staff'),
+  asyncHandler(controller.adminListCategories),
+);
+adminCatalogRouter.get(
+  '/products',
+  requireRole('storeAdmin', 'staff'),
+  asyncHandler(controller.adminListProducts),
+);
 
 adminCatalogRouter.post(
   '/categories',
@@ -49,6 +62,14 @@ adminCatalogRouter.get(
   '/products/needs-fixing',
   requireRole('storeAdmin', 'manager'),
   asyncHandler(controller.needsFixing),
+);
+// Registered AFTER the literal '/products/needs-fixing' above — Express
+// tries routes in registration order, and this :id pattern would otherwise
+// swallow that request first.
+adminCatalogRouter.get(
+  '/products/:id',
+  requireRole('storeAdmin', 'staff'),
+  asyncHandler(controller.adminGetProduct),
 );
 
 adminCatalogRouter.patch(

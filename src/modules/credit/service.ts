@@ -156,5 +156,31 @@ export async function creditExposure(tenantId: Types.ObjectId) {
   const accounts = await CreditAccount.find({ tenantId, balance: { $gt: 0 } }).sort({ balance: -1 });
   const totalExposure = accounts.reduce((sum, a) => sum + a.balance, 0);
   const overdue = accounts.filter((a) => a.dueDate < new Date());
-  return { totalExposure, accountCount: accounts.length, overdueCount: overdue.length, accounts };
+
+  // ADMIN GAP FILL — the Credit screen needs the customer's name and phone,
+  // same join pattern as modules/orders/service.ts#withCustomerInfo.
+  const customerIds = accounts.map((a) => a.customerId);
+  const customers = await User.find({ _id: { $in: customerIds } }, { name: 1, phone: 1 });
+  const byId = new Map(customers.map((c) => [String(c._id), { name: c.name, phone: c.phone }]));
+  const accountsWithCustomer = accounts.map((a) => ({
+    ...a.toJSON(),
+    customer: byId.get(String(a.customerId)) ?? null,
+    overdue: a.dueDate < new Date(),
+  }));
+
+  // ADMIN GAP FILL — "settled this month" tile on the Credit screen.
+  const startOfMonth = new Date();
+  startOfMonth.setDate(1);
+  startOfMonth.setHours(0, 0, 0, 0);
+  const monthPayments = await CreditEntry.find({ tenantId, kind: 'payment', at: { $gte: startOfMonth } });
+  const monthSettled = monthPayments.reduce((sum, e) => sum + Math.abs(e.amount), 0);
+
+  return {
+    totalExposure,
+    accountCount: accounts.length,
+    overdueCount: overdue.length,
+    accounts: accountsWithCustomer,
+    monthSettled,
+    monthSettledCount: monthPayments.length,
+  };
 }

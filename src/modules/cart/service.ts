@@ -45,9 +45,10 @@ type AxisLike = { _id: unknown; name: Localized; options: Array<{ _id: unknown; 
 function variantLabel(
   product: { axes: AxisLike[] },
   optionIds: Map<string, unknown> | Record<string, unknown>,
+  fallbackLabel?: Localized | null,
 ): Localized {
   const entries = optionIds instanceof Map ? Array.from(optionIds.entries()) : Object.entries(optionIds ?? {});
-  if (entries.length === 0) return { en: '', ar: '' };
+  if (entries.length === 0) return fallbackLabel ?? { en: '', ar: '' };
   const parts: Localized[] = [];
   for (const axis of product.axes) {
     const optionId = entries.find(([axisId]) => axisId === String(axis._id))?.[1];
@@ -105,7 +106,7 @@ export async function priceBasket(
       unitPrice,
       lineTotal: unitPrice * line.quantity,
       name: product.name,
-      variantLabel: variantLabel(product, variant.optionIds as never),
+      variantLabel: variantLabel(product, variant.optionIds as never, variant.label),
       icon: product.icon,
       stock: variant.stock as 'available' | 'low' | 'out',
     });
