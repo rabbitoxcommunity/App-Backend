@@ -69,7 +69,16 @@ const userSchema = new Schema(
 );
 
 userSchema.index({ tenantId: 1, phone: 1 }, { unique: true });
-userSchema.index({ tenantId: 1, email: 1 }, { unique: true, sparse: true });
+// `sparse: true` alone is NOT enough here: a sparse index only excludes
+// documents where the field is entirely absent, not documents where it is
+// explicitly `null` — and `email` above defaults to `null` for every
+// customer that doesn't have one. Without the partial filter, the first
+// customer with no email claims the `{tenantId, email: null}` slot and every
+// customer after them fails OTP sign-up with a duplicate-key error.
+userSchema.index(
+  { tenantId: 1, email: 1 },
+  { unique: true, partialFilterExpression: { email: { $type: 'string' } } },
+);
 userSchema.index({ tenantId: 1, role: 1, status: 1 });
 userSchema.index({ tenantId: 1, role: 1, availability: 1 });
 

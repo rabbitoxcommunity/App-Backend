@@ -20,6 +20,12 @@ import { domainEvents } from '../../lib/domainEvents.js';
 export type PlaceOrderInput = CartInput & {
   priceToken: string;
   paymentKind: 'card' | 'credit' | 'cash';
+  car?: {
+    plate: string;
+    colour: { en: string; ar: string };
+    colourHex: string;
+    bodyType: 'sedan' | 'suv' | 'pickup' | 'coupe';
+  };
 };
 
 /**
@@ -128,6 +134,7 @@ export async function placeOrder(
             confirmationCode,
             promoCode: priced.promo.applied ? priced.promo.code : null,
             addressSnapshot,
+            car: input.fulfillment === 'curbside' ? input.car : undefined,
             idempotencyKey,
           },
         ],
@@ -321,6 +328,29 @@ export async function transitionStatus(
 
 export async function markArrived(tenantId: Types.ObjectId, orderId: string, customerId: Types.ObjectId) {
   return transitionStatus(tenantId, orderId, 'customer_arrived', { userId: customerId, role: 'customer' });
+}
+
+/** §9 curbside — the customer's "on the way" / "near" ping, ahead of the customer_arrived transition. */
+export async function setArrival(
+  tenantId: Types.ObjectId,
+  orderId: string,
+  customerId: Types.ObjectId,
+  arrival: 'on_way' | 'near',
+): Promise<OrderDoc> {
+  const order = await Order.findOne({ _id: orderId, tenantId, customerId });
+  if (!order) throw AppError.notFound('Order');
+  if (order.fulfillment !== 'curbside') {
+    throw new AppError('VALIDATION_FAILED', 'Only curbside orders track arrival.');
+  }
+  if (!['placed', 'packed', 'ready_for_pickup'].includes(order.status)) {
+    throw new AppError('INVALID_TRANSITION', 'This order is no longer awaiting pickup.');
+  }
+
+  order.arrival = arrival;
+  await order.save();
+
+  realtime.orderArrival(String(tenantId), String(order._id), order.toJSON());
+  return order;
 }
 
 export async function acceptRiderOffer(tenantId: Types.ObjectId, orderId: string, riderId: Types.ObjectId) {

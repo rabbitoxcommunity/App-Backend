@@ -22,4 +22,9 @@ ordersRouter.get('/', asyncHandler(controller.list));
 ordersRouter.get('/:id', asyncHandler(controller.get));
 ordersRouter.get('/:id/receipt', asyncHandler(controller.receipt));
 ordersRouter.post('/:id/arrived', asyncHandler(controller.arrived));
+ordersRouter.patch(
+  '/:id/arrival',
+  validate({ body: controller.arrivalSchema }),
+  asyncHandler(controller.updateArrival),
+);
 ordersRouter.post('/:id/cancel', validate({ body: controller.cancelSchema }), asyncHandler(controller.cancel));

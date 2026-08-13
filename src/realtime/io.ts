@@ -89,6 +89,10 @@ export const realtime = {
   orderArrived(tenantId: string, order: unknown): void {
     nsp(tenantId)?.to('queue').emit('order.arrived', order);
   },
+  /** §9 curbside — the customer's "on the way" / "near" ping, distinct from the customer_arrived status transition above. */
+  orderArrival(tenantId: string, orderId: string, order: unknown): void {
+    nsp(tenantId)?.to(['queue', `order:${orderId}`]).emit('order.arrival', order);
+  },
   orderLines(tenantId: string, orderId: string, order: unknown): void {
     nsp(tenantId)?.to(['queue', `order:${orderId}`]).emit('order.lines', order);
   },

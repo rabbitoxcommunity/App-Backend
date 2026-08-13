@@ -9,14 +9,38 @@ const paginationQuery = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(20),
 });
 
-export const placeOrderSchema = z.object({
-  lines: z.array(z.object({ variantId: z.string().min(1), quantity: z.number().int().min(1) })),
-  promoCode: z.string().optional(),
-  fulfillment: z.enum(['delivery', 'curbside']),
-  addressId: z.string().optional(),
-  priceToken: z.string().min(1),
-  paymentKind: z.enum(['card', 'credit', 'cash']),
+const localizedSchema = z.object({ en: z.string(), ar: z.string() });
+
+const carSchema = z.object({
+  plate: z.string().min(1),
+  colour: localizedSchema,
+  colourHex: z.string().min(1),
+  bodyType: z.enum(['sedan', 'suv', 'pickup', 'coupe']),
 });
+
+export const placeOrderSchema = z
+  .object({
+    lines: z.array(z.object({ variantId: z.string().min(1), quantity: z.number().int().min(1) })),
+    promoCode: z.string().optional(),
+    fulfillment: z.enum(['delivery', 'curbside']),
+    addressId: z.string().optional(),
+    priceToken: z.string().min(1),
+    paymentKind: z.enum(['card', 'credit', 'cash']),
+    car: carSchema.optional(),
+  })
+  // Curbside staff cannot work without a car to match in the bay — captured
+  // at order creation, never asked for after the fact (see BACKEND-DESIGN §9).
+  .superRefine((data, ctx) => {
+    if (data.fulfillment === 'curbside' && !data.car) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['car'],
+        message: 'Car details are required for curbside pickup orders.',
+      });
+    }
+  });
+
+export const arrivalSchema = z.object({ arrival: z.enum(['on_way', 'near']) });
 
 export const cancelSchema = z.object({ reason: z.string().min(1) });
 
@@ -60,6 +84,10 @@ export async function receipt(req: Request, res: Response): Promise<void> {
 
 export async function arrived(req: Request, res: Response): Promise<void> {
   res.json(await service.markArrived(req.ctx.tenantId!, req.params.id!, req.ctx.userId!));
+}
+
+export async function updateArrival(req: Request, res: Response): Promise<void> {
+  res.json(await service.setArrival(req.ctx.tenantId!, req.params.id!, req.ctx.userId!, req.body.arrival));
 }
 
 export async function cancel(req: Request, res: Response): Promise<void> {
