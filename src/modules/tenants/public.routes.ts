@@ -16,7 +16,7 @@ tenantPublicRouter.get(
   '/tenants',
   asyncHandler(async (_req, res) => {
     const tenants = await Tenant.find({ status: { $in: ['trial', 'active'] } })
-      .select('slug name branding.logoUrl branding.primaryHex store.name store.address')
+      .select('slug name branding.logoUrl branding.primaryHex store.name store.address store.geo')
       .sort({ createdAt: -1 })
       .limit(200);
 
@@ -29,6 +29,7 @@ tenantPublicRouter.get(
         primaryHex: t.branding?.primaryHex ?? '#2E7A12',
         storeName: t.store?.name ?? t.name,
         address: t.store?.address ?? null,
+        geo: t.store?.geo?.lat != null && t.store?.geo?.lng != null ? { lat: t.store.geo.lat, lng: t.store.geo.lng } : null,
       })),
     });
   }),

@@ -25,12 +25,32 @@ function base32Decode(base32: string): Buffer {
   return Buffer.from(bytes);
 }
 
-export function generateTotpSecret(): string {
+/**
+ * A real RFC4648 base32 encoding: 5 bits at a time across the whole byte
+ * buffer, zero-padding only the trailing partial group. The previous version
+ * of this function picked one independently-random symbol per source byte
+ * instead — valid base32 *alphabet*, but not a valid base32 *encoding*, since
+ * a properly-encoded value's final symbol must have zero, not random,
+ * padding bits. Strict authenticator apps validate that and reject it as
+ * "invalid key" — exactly what real base32 encoding avoids.
+ */
+function base32Encode(bytes: Buffer): string {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-  const bytes = randomBytes(20);
+  let bits = '';
+  for (const b of bytes) bits += b.toString(2).padStart(8, '0');
+  // Pad the final group with zeros up to a multiple of 5 bits.
+  while (bits.length % 5 !== 0) bits += '0';
+
   let out = '';
-  for (const b of bytes) out += alphabet[b % 32];
+  for (let i = 0; i < bits.length; i += 5) {
+    out += alphabet[parseInt(bits.slice(i, i + 5), 2)];
+  }
   return out;
+}
+
+/** 10 bytes -> 16 base32 characters, byte-aligned with no partial final group — the same secret length Google Authenticator itself generates. */
+export function generateTotpSecret(): string {
+  return base32Encode(randomBytes(10));
 }
 
 function hotp(secret: Buffer, counter: number): string {
