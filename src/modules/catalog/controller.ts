@@ -131,9 +131,9 @@ export async function updateProduct(req: Request, res: Response): Promise<void> 
   res.json(product);
 }
 
-export async function archiveProduct(req: Request, res: Response): Promise<void> {
-  const product = await service.archiveProduct(req.params.id!);
-  await writeAudit(req, 'product.archive', 'products', String(product._id));
+export async function deleteProduct(req: Request, res: Response): Promise<void> {
+  const product = await service.deleteProduct(req.params.id!);
+  await writeAudit(req, 'product.delete', 'products', String(product._id));
   res.json(product);
 }
 
@@ -171,8 +171,8 @@ export async function updateCategory(req: Request, res: Response): Promise<void>
   res.json(category);
 }
 
-export async function archiveCategory(req: Request, res: Response): Promise<void> {
-  const category = await service.archiveCategory(req.params.id!);
-  await writeAudit(req, 'category.archive', 'categories', String(category._id));
+export async function deleteCategory(req: Request, res: Response): Promise<void> {
+  const category = await service.deleteCategory(req.params.id!);
+  await writeAudit(req, 'category.delete', 'categories', String(category._id));
   res.json(category);
 }

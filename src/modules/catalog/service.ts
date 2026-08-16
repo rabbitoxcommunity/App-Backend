@@ -1,6 +1,8 @@
-import { Types, type FilterQuery } from 'mongoose';
+import mongoose, { Types, type FilterQuery } from 'mongoose';
 import { Category } from '../../models/Category.js';
 import { Product } from '../../models/Product.js';
+import { NotifyRequest } from '../../models/NotifyRequest.js';
+import { PromoCode } from '../../models/PromoCode.js';
 import { SearchLog } from '../../models/SearchLog.js';
 import { buildSearchTokens } from '../../lib/searchTokens.js';
 import { isValidIcon } from '../../lib/iconCatalog.js';
@@ -241,9 +243,34 @@ export async function updateProduct(id: string, input: Partial<ProductInput>) {
   return product;
 }
 
-export async function archiveProduct(id: string) {
-  const product = await Product.findByIdAndUpdate(id, { archivedAt: new Date() }, { new: true });
+/**
+ * HARD delete. Safe for order history because order lines snapshot `name`,
+ * `unitPrice`, `variantLabel` and `icon` at purchase time (§Order.lines) —
+ * they never read the product back, so past orders still render in full.
+ *
+ * Cleans up the one collection that would otherwise be left pointing at a
+ * row that no longer exists: back-in-stock requests. Those carry a unique
+ * index on (tenantId, customerId, variantId), so leaving them behind would
+ * also block a future request if the id were ever reused.
+ *
+ * Deliberately NOT cleaned: dailyRollups keeps `topProducts[].productId` for
+ * historical analytics, which must stay accurate for periods when the product
+ * did exist.
+ */
+export async function deleteProduct(id: string) {
+  const product = await Product.findById(id);
   if (!product) throw AppError.notFound('Product');
+
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      await NotifyRequest.deleteMany({ productId: product._id }, { session });
+      await Product.deleteOne({ _id: product._id }, { session });
+    });
+  } finally {
+    await session.endSession();
+  }
+
   realtime.productChanged(String(requireTenantId()), product);
   return product;
 }
@@ -340,8 +367,25 @@ export async function updateCategory(id: string, input: Partial<CategoryInput>) 
   return category;
 }
 
-export async function archiveCategory(id: string) {
-  const productCount = await Product.countDocuments({ categoryId: id, archivedAt: null });
+/**
+ * HARD delete, still refusing while products point at it (§4.7/§21) — that
+ * guard matters more now, not less: with a soft delete a stray reference
+ * merely pointed at a hidden row, whereas here it would dangle entirely.
+ *
+ * `categoryIds` on promo codes IS repaired, because a promo scoped to a
+ * deleted category would otherwise silently stop matching anything with no
+ * indication why.
+ */
+export async function deleteCategory(id: string) {
+  // Existence first: checking the guard first reported "N products still
+  // reference this" for a category that simply didn't exist, which is a
+  // confusing thing to tell someone.
+  const category = await Category.findById(id);
+  if (!category) throw AppError.notFound('Category');
+
+  // Counts archived products too: an archived product still carries this
+  // categoryId, so deleting out from under it would dangle that reference.
+  const productCount = await Product.countDocuments({ categoryId: id });
   if (productCount > 0) {
     throw new AppError(
       'VALIDATION_FAILED',
@@ -349,8 +393,21 @@ export async function archiveCategory(id: string) {
       { productCount },
     );
   }
-  const category = await Category.findByIdAndUpdate(id, { archivedAt: new Date() }, { new: true });
-  if (!category) throw AppError.notFound('Category');
+
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      await PromoCode.updateMany(
+        { categoryIds: category._id },
+        { $pull: { categoryIds: category._id } },
+        { session },
+      );
+      await Category.deleteOne({ _id: category._id }, { session });
+    });
+  } finally {
+    await session.endSession();
+  }
+
   realtime.categoryChanged(String(requireTenantId()), category);
   return category;
 }

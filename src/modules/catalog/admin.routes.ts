@@ -38,7 +38,7 @@ adminCatalogRouter.patch(
 adminCatalogRouter.delete(
   '/categories/:id',
   requireRole('storeAdmin', 'manager'),
-  asyncHandler(controller.archiveCategory),
+  asyncHandler(controller.deleteCategory),
 );
 
 adminCatalogRouter.post(
@@ -56,7 +56,7 @@ adminCatalogRouter.patch(
 adminCatalogRouter.delete(
   '/products/:id',
   requireRole('storeAdmin', 'manager'),
-  asyncHandler(controller.archiveProduct),
+  asyncHandler(controller.deleteProduct),
 );
 adminCatalogRouter.get(
   '/products/needs-fixing',

@@ -67,7 +67,17 @@ const productSchema = new Schema(
 productSchema.index({ tenantId: 1, categoryId: 1, status: 1, archivedAt: 1 });
 productSchema.index({ tenantId: 1, popularity: -1 });
 productSchema.index({ tenantId: 1, createdAt: -1 });
-productSchema.index({ tenantId: 1, 'variants.barcode': 1 }, { unique: true, sparse: true });
+// `sparse: true` is NOT enough here, for the same reason it wasn't on
+// users.email: sparse only skips documents where the key is ABSENT, but
+// `barcode` above defaults to `null`, so every barcode-less variant stores an
+// explicit null and IS indexed. The first such product claimed the
+// {tenantId, null} slot and every later barcode-less product collided —
+// meaning a shop could only ever have one product without a barcode.
+// A partial index over string barcodes only leaves nulls unconstrained.
+productSchema.index(
+  { tenantId: 1, 'variants.barcode': 1 },
+  { unique: true, partialFilterExpression: { 'variants.barcode': { $type: 'string' } } },
+);
 productSchema.index({ tenantId: 1, 'variants._id': 1 });
 
 productSchema.plugin(tenantScopePlugin);
