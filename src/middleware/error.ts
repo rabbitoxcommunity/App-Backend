@@ -35,6 +35,22 @@ export function errorHandler(
     return;
   }
 
+  // A unique-index violation (e.g. {tenantId, email}, {tenantId, phone}) is a
+  // MongoDB-level constraint, not something Mongoose's own validators catch —
+  // left untranslated it bubbles up as an opaque 500. Every unique index in
+  // this app pairs the real field with tenantId, so the offending field is
+  // whichever key in keyPattern isn't tenantId.
+  const asDriverError = err as { code?: number; keyPattern?: Record<string, unknown> };
+  if (asDriverError.code === 11000) {
+    const field = Object.keys(asDriverError.keyPattern ?? {}).find((k) => k !== 'tenantId');
+    const label = field === 'email' ? 'email address' : field === 'phone' ? 'phone number' : field ? field : 'value';
+    const conflict = AppError.conflict(`This ${label} is already in use.`, field ? { field } : {});
+    res.status(conflict.status).json({
+      error: { code: conflict.code, message: conflict.message, details: conflict.details, requestId },
+    });
+    return;
+  }
+
   logger.error({ err, requestId }, 'Unhandled error');
   res.status(500).json({
     error: { code: 'INTERNAL', message: 'Something went wrong.', details: {}, requestId },

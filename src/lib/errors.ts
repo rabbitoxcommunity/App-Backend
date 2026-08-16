@@ -38,4 +38,8 @@ export class AppError extends Error {
   static unauthenticated(message = 'Missing or expired credentials.'): AppError {
     return new AppError('UNAUTHENTICATED', message);
   }
+
+  static conflict(message: string, details: Record<string, unknown> = {}): AppError {
+    return new AppError('CONFLICT', message, details);
+  }
 }

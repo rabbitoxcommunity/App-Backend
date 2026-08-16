@@ -26,6 +26,32 @@ export async function writeAudit(
   });
 }
 
+/**
+ * §19 platform-level audit — `writeAudit` above deliberately no-ops when
+ * `req.ctx.tenantId` is null (every superAdmin request), so suspend/
+ * reactivate/configure/onboard/reset-owner-access need their own path. Each
+ * of those actions IS about one specific tenant, so the row still carries
+ * that tenantId even though the actor (a PlatformUser) isn't a member of it.
+ */
+export async function writePlatformAudit(
+  req: Request,
+  tenantId: string,
+  action: string,
+  documentId: string | null,
+  changes: Record<string, { before: unknown; after: unknown }> = {},
+): Promise<void> {
+  await AuditLog.create({
+    tenantId,
+    actorId: req.ctx.userId,
+    actorRole: 'superAdmin',
+    action,
+    collectionName: 'tenants',
+    documentId,
+    changes,
+    ip: req.ip,
+  });
+}
+
 export function diff(
   before: Record<string, unknown>,
   after: Record<string, unknown>,

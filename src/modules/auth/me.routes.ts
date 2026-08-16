@@ -20,6 +20,7 @@ meRouter.get(
 
 const patchMeSchema = z.object({
   name: z.string().min(1).optional(),
+  email: z.string().email().optional(),
   language: z.enum(['en', 'ar']).optional(),
 });
 

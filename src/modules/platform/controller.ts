@@ -2,6 +2,7 @@ import type { Request, Response } from 'express';
 import { z } from 'zod';
 import * as service from './service.js';
 import { AppError } from '../../lib/errors.js';
+import { writePlatformAudit } from '../../lib/audit.js';
 
 const localizedSchema = z.object({ en: z.string(), ar: z.string() });
 const paginationQuery = z.object({
@@ -43,19 +44,37 @@ export async function getTenant(req: Request, res: Response): Promise<void> {
 }
 
 export async function onboard(req: Request, res: Response): Promise<void> {
-  res.status(201).json(await service.onboard(req.body));
+  const result = await service.onboard(req.body);
+  await writePlatformAudit(req, result.tenantId, 'platform.onboard', result.tenantId, {
+    slug: { before: null, after: req.body.slug },
+  });
+  res.status(201).json(result);
 }
 
 export async function configure(req: Request, res: Response): Promise<void> {
-  res.json(await service.configureTenant(req.params.id!, req.body));
+  const tenant = await service.configureTenant(req.params.id!, req.body);
+  await writePlatformAudit(req, req.params.id!, 'platform.configure', req.params.id!, {
+    fields: { before: null, after: Object.keys(req.body) },
+  });
+  res.json(tenant);
 }
 
 export async function suspend(req: Request, res: Response): Promise<void> {
-  res.json(await service.suspendTenant(req.params.id!));
+  const tenant = await service.suspendTenant(req.params.id!);
+  await writePlatformAudit(req, req.params.id!, 'platform.suspend', req.params.id!);
+  res.json(tenant);
 }
 
 export async function reactivate(req: Request, res: Response): Promise<void> {
-  res.json(await service.reactivateTenant(req.params.id!));
+  const tenant = await service.reactivateTenant(req.params.id!);
+  await writePlatformAudit(req, req.params.id!, 'platform.reactivate', req.params.id!);
+  res.json(tenant);
+}
+
+export async function resetOwnerAccess(req: Request, res: Response): Promise<void> {
+  const result = await service.resetOwnerAccess(req.params.id!);
+  await writePlatformAudit(req, req.params.id!, 'platform.resetOwnerAccess', req.params.id!);
+  res.json(result);
 }
 
 export async function impersonate(req: Request, res: Response): Promise<void> {
@@ -88,14 +107,25 @@ export async function listInvoices(req: Request, res: Response): Promise<void> {
   res.json(await service.listInvoices(q));
 }
 export async function issueInvoice(req: Request, res: Response): Promise<void> {
-  res.json(await service.issueInvoice(req.params.id!));
+  const invoice = await service.issueInvoice(req.params.id!);
+  await writePlatformAudit(req, String(invoice.tenantId), 'platform.invoice.issue', req.params.id!);
+  res.json(invoice);
 }
 export async function markInvoicePaid(req: Request, res: Response): Promise<void> {
-  res.json(await service.markInvoicePaid(req.params.id!, req.body.paymentRef));
+  const invoice = await service.markInvoicePaid(req.params.id!, req.body.paymentRef);
+  await writePlatformAudit(req, String(invoice.tenantId), 'platform.invoice.markPaid', req.params.id!, {
+    paymentRef: { before: null, after: req.body.paymentRef },
+  });
+  res.json(invoice);
 }
 
 export async function analytics(_req: Request, res: Response): Promise<void> {
   res.json(await service.platformAnalytics());
+}
+
+export async function auditLog(req: Request, res: Response): Promise<void> {
+  const q = paginationQuery.parse(req.query);
+  res.json(await service.platformAuditLog(q));
 }
 
 export async function listUsers(_req: Request, res: Response): Promise<void> {

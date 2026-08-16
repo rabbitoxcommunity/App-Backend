@@ -15,6 +15,7 @@ platformRouter.get('/tenants/:id', asyncHandler(controller.getTenant));
 platformRouter.patch('/tenants/:id', asyncHandler(controller.configure));
 platformRouter.post('/tenants/:id/suspend', asyncHandler(controller.suspend));
 platformRouter.post('/tenants/:id/reactivate', asyncHandler(controller.reactivate));
+platformRouter.post('/tenants/:id/reset-owner-access', asyncHandler(controller.resetOwnerAccess));
 platformRouter.post('/tenants/:id/impersonate', asyncHandler(controller.impersonate));
 
 platformRouter.get('/plans', asyncHandler(controller.listPlans));
@@ -31,6 +32,7 @@ platformRouter.post(
 );
 
 platformRouter.get('/analytics', asyncHandler(controller.analytics));
+platformRouter.get('/audit', asyncHandler(controller.auditLog));
 
 platformRouter.get('/users', asyncHandler(controller.listUsers));
 platformRouter.post('/users', validate({ body: controller.platformUserSchema }), asyncHandler(controller.createUser));
