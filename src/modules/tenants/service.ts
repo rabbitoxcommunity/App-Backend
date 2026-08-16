@@ -19,6 +19,8 @@ export type OnboardTenantInput = {
   storeName: Localized;
 };
 
+const TRIAL_DAYS = 14;
+
 /**
  * §19.1 TENANT ONBOARDING — creates the tenant, its owner storeAdmin user,
  * a default paymentMethods set and a default merchandising document, in ONE
@@ -39,6 +41,7 @@ export async function onboardTenant(input: OnboardTenantInput) {
             status: 'trial',
             contact: { ownerName: input.ownerName, email: input.ownerEmail, phone: input.ownerPhone },
             store: { name: input.storeName },
+            plan: { trialEndsAt: new Date(Date.now() + TRIAL_DAYS * 24 * 60 * 60 * 1000) },
           },
         ],
         { session },

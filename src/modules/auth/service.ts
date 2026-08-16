@@ -11,6 +11,7 @@ import { signAccessToken, type AccessTokenClaims } from '../../lib/jwt.js';
 import { normalizePhone, isValidUaePhone } from '../../lib/phone.js';
 import { verifyTotp } from '../../lib/totp.js';
 import { AppError } from '../../lib/errors.js';
+import { assertTenantLive } from '../../lib/tenantAccess.js';
 import { env } from '../../config/env.js';
 
 const OTP_TTL_MS = 5 * 60 * 1000;
@@ -202,9 +203,7 @@ export async function staffLogin(
 ): Promise<TokenPair & { user: InstanceType<typeof User> }> {
   const tenant = await Tenant.findOne({ slug: tenantSlug.toLowerCase() });
   if (!tenant) throw AppError.notFound('Tenant');
-  if (tenant.status === 'suspended') {
-    throw new AppError('TENANT_SUSPENDED', 'This store is currently suspended.');
-  }
+  assertTenantLive(tenant);
 
   const user = await User.findOne({
     tenantId: tenant._id,

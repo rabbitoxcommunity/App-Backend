@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { Tenant } from '../../models/Tenant.js';
 import { asyncHandler } from '../../lib/asyncHandler.js';
 import { AppError } from '../../lib/errors.js';
+import { assertTenantLive, isTrialExpired } from '../../lib/tenantAccess.js';
 
 export const tenantPublicRouter = Router();
 
@@ -16,21 +17,23 @@ tenantPublicRouter.get(
   '/tenants',
   asyncHandler(async (_req, res) => {
     const tenants = await Tenant.find({ status: { $in: ['trial', 'active'] } })
-      .select('slug name branding.logoUrl branding.primaryHex store.name store.address store.geo')
+      .select('slug name branding.logoUrl branding.primaryHex store.name store.address store.geo status plan.trialEndsAt')
       .sort({ createdAt: -1 })
       .limit(200);
 
     res.json({
-      items: tenants.map((t) => ({
-        id: String(t._id),
-        slug: t.slug,
-        name: t.name,
-        logoUrl: t.branding?.logoUrl ?? null,
-        primaryHex: t.branding?.primaryHex ?? '#2E7A12',
-        storeName: t.store?.name ?? t.name,
-        address: t.store?.address ?? null,
-        geo: t.store?.geo?.lat != null && t.store?.geo?.lng != null ? { lat: t.store.geo.lat, lng: t.store.geo.lng } : null,
-      })),
+      items: tenants
+        .filter((t) => !isTrialExpired(t))
+        .map((t) => ({
+          id: String(t._id),
+          slug: t.slug,
+          name: t.name,
+          logoUrl: t.branding?.logoUrl ?? null,
+          primaryHex: t.branding?.primaryHex ?? '#2E7A12',
+          storeName: t.store?.name ?? t.name,
+          address: t.store?.address ?? null,
+          geo: t.store?.geo?.lat != null && t.store?.geo?.lng != null ? { lat: t.store.geo.lat, lng: t.store.geo.lng } : null,
+        })),
     });
   }),
 );
@@ -48,9 +51,7 @@ tenantPublicRouter.get(
     }
     const tenant = await Tenant.findById(req.ctx.tenantId);
     if (!tenant) throw AppError.notFound('Tenant');
-    if (tenant.status === 'suspended') {
-      throw new AppError('TENANT_SUSPENDED', 'This store is currently suspended.');
-    }
+    assertTenantLive(tenant);
 
     res.json({
       name: tenant.name,
