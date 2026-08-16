@@ -9,6 +9,7 @@ import { AppError } from '../../lib/errors.js';
 import { assertProductLimit } from '../../lib/planLimits.js';
 import { requireTenantId } from '../../context/requestContext.js';
 import { domainEvents } from '../../lib/domainEvents.js';
+import { realtime } from '../../realtime/io.js';
 
 // ------------------------------------------------------------------ public
 
@@ -214,6 +215,7 @@ export async function createProduct(input: ProductInput) {
     product.defaultVariantId = product.variants[0]._id;
   }
   await product.save();
+  realtime.productChanged(String(requireTenantId()), product);
   return product;
 }
 
@@ -235,12 +237,14 @@ export async function updateProduct(id: string, input: Partial<ProductInput>) {
     ...product.variants.map((v) => v.barcode ?? '').filter(Boolean),
   ]);
   await product.save();
+  realtime.productChanged(String(requireTenantId()), product);
   return product;
 }
 
 export async function archiveProduct(id: string) {
   const product = await Product.findByIdAndUpdate(id, { archivedAt: new Date() }, { new: true });
   if (!product) throw AppError.notFound('Product');
+  realtime.productChanged(String(requireTenantId()), product);
   return product;
 }
 
@@ -268,6 +272,13 @@ export async function updateVariantStock(
       productName: product.name.en,
     });
   }
+
+  realtime.stockChanged(String(requireTenantId()), {
+    productId: String(product._id),
+    variantId,
+    stock: variant.stock,
+    lowStockCount: variant.lowStockCount,
+  });
 
   return { product, variant };
 }
@@ -311,7 +322,9 @@ export async function createCategory(input: CategoryInput) {
     throw AppError.validationFailed({ icon: `"${input.icon}" is not in the icon catalog.` });
   }
   assertPublishReady(input);
-  return Category.create(input);
+  const category = await Category.create(input);
+  realtime.categoryChanged(String(requireTenantId()), category);
+  return category;
 }
 
 export async function updateCategory(id: string, input: Partial<CategoryInput>) {
@@ -323,6 +336,7 @@ export async function updateCategory(id: string, input: Partial<CategoryInput>) 
   assertPublishReady({ name: input.name ?? category.name, status: input.status ?? category.status });
   Object.assign(category, input);
   await category.save();
+  realtime.categoryChanged(String(requireTenantId()), category);
   return category;
 }
 
@@ -337,5 +351,6 @@ export async function archiveCategory(id: string) {
   }
   const category = await Category.findByIdAndUpdate(id, { archivedAt: new Date() }, { new: true });
   if (!category) throw AppError.notFound('Category');
+  realtime.categoryChanged(String(requireTenantId()), category);
   return category;
 }

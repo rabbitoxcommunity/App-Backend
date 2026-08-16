@@ -4,6 +4,7 @@ import { z } from 'zod';
 import * as service from './service.js';
 import { writeAudit } from '../../lib/audit.js';
 import { AppError } from '../../lib/errors.js';
+import { realtime } from '../../realtime/io.js';
 
 const paginationQuery = z.object({
   cursor: z.string().optional(),
@@ -36,6 +37,7 @@ export async function approve(req: Request, res: Response): Promise<void> {
   await writeAudit(req, 'credit.approve', 'creditAccounts', String(account._id), {
     limit: { before: null, after: req.body.limit },
   });
+  realtime.creditChanged(String(req.ctx.tenantId), req.params.id!, account);
   res.json(account);
 }
 
@@ -64,6 +66,13 @@ export async function recordPayment(req: Request, res: Response): Promise<void> 
   await writeAudit(req, 'credit.payment', 'creditEntries', String(entry._id), {
     amount: { before: null, after: req.body.amount },
   });
+  // §14 — emit only after the transaction has committed, mirroring the
+  // account state that's now actually in MongoDB.
+  const account = await service.getAccount(
+    req.ctx.tenantId!,
+    new mongoose.Types.ObjectId(req.params.customerId!),
+  );
+  realtime.creditChanged(String(req.ctx.tenantId), req.params.customerId!, account);
   res.status(201).json(entry);
 }
 

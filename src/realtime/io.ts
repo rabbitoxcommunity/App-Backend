@@ -22,9 +22,28 @@ export function attachSocketServer(server: HttpServer): Server {
     cors: { origin: true, credentials: true },
   });
 
-  io.of(/^\/t\/[a-f0-9]{24}$/).use((socket: Socket, next) => {
+  // MUST be a single `io.of(regex)` instance shared by both the middleware and
+  // the connection handler. Each `io.of(regex)` call constructs a SEPARATE
+  // ParentNamespace; the first one to match a connecting client is the one that
+  // spawns the child namespace, so handlers registered on any other instance
+  // never fire for that child. Registering `.use()` and `.on('connection')` on
+  // two different instances silently skipped every `socket.join(...)` below —
+  // auth still ran, but no socket ever joined `queue`/`rider:`/`customer:`, so
+  // every room-targeted emit (i.e. all order events) reached nobody.
+  const tenantNsp = io.of(/^\/t\/[a-f0-9]{24}$/);
+
+  tenantNsp.use((socket: Socket, next) => {
     const token = socket.handshake.auth?.token as string | undefined;
-    if (!token) return next(new Error('Missing token'));
+    // Anonymous connections are allowed: categories/products/payment methods
+    // are already public, unauthenticated REST data (§10), so a customer
+    // browsing before login still gets live storefront updates. They get no
+    // role and join no rooms, so they only ever receive namespace-wide
+    // broadcasts — never `queue`, `rider:<id>`, or `customer:<id>`.
+    if (!token) {
+      socket.data.role = null;
+      socket.data.userId = null;
+      return next();
+    }
     try {
       const claims = verifyAccessToken(token);
       const namespaceTenantId = socket.nsp.name.split('/t/')[1];
@@ -39,14 +58,19 @@ export function attachSocketServer(server: HttpServer): Server {
     }
   });
 
-  io.of(/^\/t\/[a-f0-9]{24}$/).on('connection', (socket: Socket) => {
-    const { role, userId } = socket.data as { role: string; userId: string };
+  tenantNsp.on('connection', (socket: Socket) => {
+    const { role, userId } = socket.data as { role: string | null; userId: string | null };
 
     if (role === 'storeAdmin') {
       socket.join('queue');
     }
     if (role === 'deliveryStaff') {
       socket.join(`rider:${userId}`);
+    }
+    // Credit balance is private — only this customer's own connections (and
+    // the admin queue) should receive `credit.changed`.
+    if (role === 'customer') {
+      socket.join(`customer:${userId}`);
     }
 
     socket.on('order:watch', (orderId: string) => {
@@ -73,30 +97,64 @@ function nsp(tenantId: string) {
   return io.of(`/t/${tenantId}`);
 }
 
+/**
+ * The owning customer's private room, read off the emitted order itself.
+ *
+ * Without this, a customer only received events for orders whose
+ * `order:<id>` room they had explicitly joined via `order:watch` — and the
+ * app only ever watches ONE order at a time. A customer with several orders
+ * in flight silently got no updates for any but that one. Every customer
+ * connection already joins `customer:<userId>` on connect, so routing here
+ * covers all of their orders with no per-order subscription bookkeeping.
+ */
+function customerRoom(order: unknown): string | null {
+  const customerId = (order as { customerId?: unknown } | null)?.customerId;
+  return customerId ? `customer:${String(customerId)}` : null;
+}
+
 /** §14 event emitters — call after the triggering write has committed. */
 export const realtime = {
   orderCreated(tenantId: string, order: unknown): void {
-    nsp(tenantId)?.to('queue').emit('order.created', order);
+    const rooms = ['queue', customerRoom(order)].filter(Boolean) as string[];
+    nsp(tenantId)?.to(rooms).emit('order.created', order);
   },
   orderStatus(tenantId: string, orderId: string, riderId: string | null, order: unknown): void {
-    const rooms = ['queue', `order:${orderId}`];
+    const rooms = ['queue', `order:${orderId}`, customerRoom(order)].filter(Boolean) as string[];
     if (riderId) rooms.push(`rider:${riderId}`);
     nsp(tenantId)?.to(rooms).emit('order.status', order);
   },
   orderAssigned(tenantId: string, riderId: string, order: unknown): void {
-    nsp(tenantId)?.to(['queue', `rider:${riderId}`]).emit('order.assigned', order);
+    const rooms = ['queue', `rider:${riderId}`, customerRoom(order)].filter(Boolean) as string[];
+    nsp(tenantId)?.to(rooms).emit('order.assigned', order);
   },
   orderArrived(tenantId: string, order: unknown): void {
-    nsp(tenantId)?.to('queue').emit('order.arrived', order);
+    const rooms = ['queue', customerRoom(order)].filter(Boolean) as string[];
+    nsp(tenantId)?.to(rooms).emit('order.arrived', order);
   },
   /** §9 curbside — the customer's "on the way" / "near" ping, distinct from the customer_arrived status transition above. */
   orderArrival(tenantId: string, orderId: string, order: unknown): void {
-    nsp(tenantId)?.to(['queue', `order:${orderId}`]).emit('order.arrival', order);
+    const rooms = ['queue', `order:${orderId}`, customerRoom(order)].filter(Boolean) as string[];
+    nsp(tenantId)?.to(rooms).emit('order.arrival', order);
   },
   orderLines(tenantId: string, orderId: string, order: unknown): void {
-    nsp(tenantId)?.to(['queue', `order:${orderId}`]).emit('order.lines', order);
+    const rooms = ['queue', `order:${orderId}`, customerRoom(order)].filter(Boolean) as string[];
+    nsp(tenantId)?.to(rooms).emit('order.lines', order);
   },
+  /** Stock is already public via the product REST endpoints, so this reaches everyone — admin queue and browsing customers alike. */
   stockChanged(tenantId: string, variant: unknown): void {
-    nsp(tenantId)?.to('queue').emit('stock.changed', variant);
+    nsp(tenantId)?.emit('stock.changed', variant);
+  },
+  categoryChanged(tenantId: string, category: unknown): void {
+    nsp(tenantId)?.emit('category.changed', category);
+  },
+  productChanged(tenantId: string, product: unknown): void {
+    nsp(tenantId)?.emit('product.changed', product);
+  },
+  paymentMethodChanged(tenantId: string, method: unknown): void {
+    nsp(tenantId)?.emit('payment-method.changed', method);
+  },
+  /** Private to the customer whose balance changed, plus the admin queue (Credit/Customers screens). */
+  creditChanged(tenantId: string, customerId: string, account: unknown): void {
+    nsp(tenantId)?.to(['queue', `customer:${customerId}`]).emit('credit.changed', account);
   },
 };

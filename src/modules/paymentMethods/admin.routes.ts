@@ -6,6 +6,7 @@ import { asyncHandler } from '../../lib/asyncHandler.js';
 import { writeAudit } from '../../lib/audit.js';
 import { PaymentMethod } from '../../models/PaymentMethod.js';
 import { AppError } from '../../lib/errors.js';
+import { realtime } from '../../realtime/io.js';
 
 /**
  * ADMIN GAP FILL — the Settings screen shows enable/disable state for card,
@@ -46,6 +47,7 @@ adminPaymentMethodsRouter.patch(
     await writeAudit(req, 'paymentMethod.update', 'paymentMethods', req.params.id!, {
       fields: { before: null, after: Object.keys(req.body) },
     });
+    realtime.paymentMethodChanged(String(req.ctx.tenantId), method);
     res.json(method);
   }),
 );
