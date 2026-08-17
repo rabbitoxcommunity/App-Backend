@@ -20,10 +20,26 @@ export const listProductsQuery = paginationQuery.extend({
 
 export const searchQuery = paginationQuery.extend({ q: z.string().min(1) });
 
+export const adminListCategoriesQuery = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  // Default is deliberately high, unlike products. Three screens (Products,
+  // AddProduct, AddCategory) call this to fill a category dropdown and need
+  // every row, not the first page — a low default would silently truncate
+  // them. Only the Categories list screen paginates, and it sends an explicit
+  // limit.
+  limit: z.coerce.number().int().min(1).max(500).default(500),
+  q: z.string().optional(),
+});
+
+export const categoryPositionSchema = z.object({
+  position: z.coerce.number().int().min(1),
+});
+
 export const adminListProductsQuery = paginationQuery.extend({
   q: z.string().optional(),
   category: z.string().optional(),
   status: z.enum(['draft', 'published']).optional(),
+  stock: z.enum(['available', 'low', 'out']).optional(),
   includeArchived: z.coerce.boolean().optional(),
 });
 
@@ -105,8 +121,20 @@ export async function adminListProducts(req: Request, res: Response): Promise<vo
   res.json(await service.adminListProducts(adminListProductsQuery.parse(req.query)));
 }
 
-export async function adminListCategories(_req: Request, res: Response): Promise<void> {
-  res.json(await service.adminListCategories());
+export async function adminListCategories(req: Request, res: Response): Promise<void> {
+  res.json(await service.adminListCategories(adminListCategoriesQuery.parse(req.query)));
+}
+
+export async function adminGetCategory(req: Request, res: Response): Promise<void> {
+  res.json(await service.adminGetCategory(req.params.id!));
+}
+
+export async function setCategoryPosition(req: Request, res: Response): Promise<void> {
+  const result = await service.setCategoryPosition(req.params.id!, req.body.position);
+  await writeAudit(req, 'category.reorder', 'categories', req.params.id!, {
+    position: { before: null, after: result.position },
+  });
+  res.json(result);
 }
 
 export async function adminGetProduct(req: Request, res: Response): Promise<void> {

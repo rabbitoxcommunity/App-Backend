@@ -151,6 +151,7 @@ export async function adminListProducts(opts: {
   q?: string;
   category?: string;
   status?: 'draft' | 'published';
+  stock?: 'available' | 'low' | 'out';
   includeArchived?: boolean;
 }) {
   const filter: FilterQuery<typeof Product> = {};
@@ -159,6 +160,10 @@ export async function adminListProducts(opts: {
   if (opts.category) {
     filter.categoryId = opts.category === 'none' ? null : opts.category;
   }
+  // Stock lives per variant, so this matches a product with AT LEAST ONE variant
+  // in that state — "out of stock" surfaces partially-out products too, which is
+  // what someone restocking wants to see.
+  if (opts.stock) filter['variants.stock'] = opts.stock;
   if (opts.q) {
     const tokens = buildSearchTokens([opts.q]);
     filter.$or = [
@@ -175,9 +180,102 @@ export async function adminListProducts(opts: {
   return { items, page: opts.page, limit: opts.limit, total };
 }
 
-/** ADMIN GAP FILL — admin category management needs drafts and hidden rows too. */
-export async function adminListCategories() {
-  return Category.find({ archivedAt: null }).sort({ sortOrder: 1 });
+/**
+ * ADMIN GAP FILL — admin category management needs drafts and hidden rows too.
+ *
+ * Returns `productCount` per row from ONE aggregation. The Categories screen
+ * used to derive it by firing `/admin/products?category=<id>&limit=1` once per
+ * category — 89 HTTP round trips to render a single page, growing with the
+ * catalogue.
+ */
+export async function adminListCategories(opts: { page: number; limit: number; q?: string }) {
+  const filter: FilterQuery<typeof Category> = { archivedAt: null };
+  if (opts.q?.trim()) {
+    const rx = new RegExp(escapeRegex(opts.q.trim()), 'i');
+    filter.$or = [{ 'name.en': rx }, { 'name.ar': rx }, { slug: rx }];
+  }
+
+  const skip = (opts.page - 1) * opts.limit;
+  // _id breaks ties: sortOrder is not unique (imported rows can share one), and
+  // an unstable sort would let a row jump pages between requests.
+  const [items, total] = await Promise.all([
+    Category.find(filter).sort({ sortOrder: 1, _id: 1 }).skip(skip).limit(opts.limit),
+    Category.countDocuments(filter),
+  ]);
+
+  const counts = await Product.aggregate<{ _id: Types.ObjectId; n: number }>([
+    { $match: { categoryId: { $in: items.map((c) => c._id) }, archivedAt: null } },
+    { $group: { _id: '$categoryId', n: { $sum: 1 } } },
+  ]);
+  const countBy = new Map(counts.map((c) => [String(c._id), c.n]));
+
+  /**
+   * `position` is each row's rank in the FULL ordering, resolved here rather
+   * than inferred client-side from the row index. The index is only the
+   * position when the list is unfiltered and on page 1 — under a search it
+   * reported every match as position 1.
+   *
+   * Computed as a rank instead of `sortOrder + 1` because sortOrder is not
+   * dependably contiguous: deletes leave gaps and a category created without
+   * an explicit sortOrder defaults to 0.
+   */
+  const ordered = await Category.find({ archivedAt: null })
+    .select('_id')
+    .sort({ sortOrder: 1, _id: 1 })
+    .lean();
+  const rankById = new Map(ordered.map((c, i) => [String(c._id), i + 1]));
+
+  return {
+    items: items.map((c) => ({
+      ...c.toJSON(),
+      productCount: countBy.get(String(c._id)) ?? 0,
+      position: rankById.get(String(c._id)) ?? null,
+    })),
+    page: opts.page,
+    limit: opts.limit,
+    total,
+    // Unfiltered count — the valid range for a position. `total` shrinks to the
+    // match count under a search and must never be used to bound a move.
+    overallTotal: ordered.length,
+  };
+}
+
+/** ADMIN GAP FILL — the edit form needs one category regardless of status/visibility. */
+export async function adminGetCategory(id: string) {
+  if (!Types.ObjectId.isValid(id)) throw AppError.notFound('Category');
+  const category = await Category.findOne({ _id: id, archivedAt: null });
+  if (!category) throw AppError.notFound('Category');
+  return category;
+}
+
+/**
+ * Move a category to an explicit 1-based position and renumber the rest.
+ *
+ * Reordering has to be a server operation rather than the client PATCHing
+ * sortOrder values: positions are only meaningful relative to every other
+ * category, and the list is paginated, so the client never holds the full
+ * ordering to compute them from.
+ */
+export async function setCategoryPosition(id: string, position: number) {
+  const all = await Category.find({ archivedAt: null }).sort({ sortOrder: 1, _id: 1 });
+  const from = all.findIndex((c) => String(c._id) === id);
+  if (from === -1) throw AppError.notFound('Category');
+
+  const to = Math.min(Math.max(position, 1), all.length) - 1;
+  const [moved] = all.splice(from, 1);
+  all.splice(to, 0, moved!);
+
+  // bulkWrite is NOT one of tenantScopePlugin's hooked operations, so it is
+  // not auto-scoped — safe only because every _id here came out of the scoped
+  // find above. Do not widen this to a filter-based update.
+  const ops = all
+    .map((c, i) => ({ c, i }))
+    .filter(({ c, i }) => c.sortOrder !== i)
+    .map(({ c, i }) => ({ updateOne: { filter: { _id: c._id }, update: { $set: { sortOrder: i } } } }));
+  if (ops.length > 0) await Category.bulkWrite(ops);
+
+  realtime.categoryChanged(String(requireTenantId()), moved!);
+  return { id, position: to + 1, renumbered: ops.length };
 }
 
 /** ADMIN GAP FILL — the edit form needs a single product regardless of status (public getProduct only returns published). */
@@ -349,7 +447,13 @@ export async function createCategory(input: CategoryInput) {
     throw AppError.validationFailed({ icon: `"${input.icon}" is not in the icon catalog.` });
   }
   assertPublishReady(input);
-  const category = await Category.create(input);
+  // Without this the schema default (0) applies, so every new category lands at
+  // position 1 and ties with whatever is already there. New ones belong last.
+  const sortOrder =
+    input.sortOrder ??
+    ((await Category.findOne({ archivedAt: null }).sort({ sortOrder: -1 }).select('sortOrder'))
+      ?.sortOrder ?? -1) + 1;
+  const category = await Category.create({ ...input, sortOrder });
   realtime.categoryChanged(String(requireTenantId()), category);
   return category;
 }

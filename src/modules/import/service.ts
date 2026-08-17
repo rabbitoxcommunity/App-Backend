@@ -5,7 +5,7 @@ import { Product } from '../../models/Product.js';
 import { Category } from '../../models/Category.js';
 import { AppError } from '../../lib/errors.js';
 import { fuzzyMatch } from '../../lib/fuzzy.js';
-import { isValidIcon } from '../../lib/iconCatalog.js';
+import { guessCategoryIcon, isValidIcon } from '../../lib/iconCatalog.js';
 import { buildSearchTokens } from '../../lib/searchTokens.js';
 import { importQueue } from '../../jobs/queues.js';
 import { logger } from '../../config/logger.js';
@@ -26,7 +26,14 @@ async function fetchWorkbook(fileUrl: string): Promise<XLSX.WorkBook> {
   // Arabic name to be publishable at all (§4 Localized rule), so every
   // imported row was effectively unpublishable. XLSX files carry their own
   // encoding and are unaffected, but passing this is harmless for them.
-  return XLSX.read(buffer, { type: 'buffer', codepage: 65001 });
+  //
+  // raw:true keeps cells as text instead of coercing them. A CSV has no cell
+  // types, so SheetJS reads a zero-padded barcode as a NUMBER and silently
+  // drops the padding — "000001346923" became 1346923, which breaks till
+  // scanning and collapses two distinct SKUs into one. XLSX files carry
+  // explicit string cells and read identically either way (verified against a
+  // 4,853-row sheet: same values, prices still parse).
+  return XLSX.read(buffer, { type: 'buffer', codepage: 65001, raw: true });
 }
 
 function sheetToRows(workbook: XLSX.WorkBook): Record<string, unknown>[] {
@@ -185,19 +192,31 @@ export async function commitBatch(batchId: string, tenantId: string) {
   return batch;
 }
 
+const slugifyCategory = (s: string): string =>
+  s
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'category';
+
 /**
  * The actual write, run by the BullMQ worker (registered in
  * modules/import/worker.ts). Exported separately so it can also be unit
  * tested without touching the queue.
  *
  * CATEGORY CLEANUP (§17): fuzzy-match against existing category names in
- * both languages. No confident match -> product lands uncategorised with
- * status draft (needs-fixing queue), import never invents categories.
+ * both languages, and CREATE the category when nothing matches. The original
+ * rule was "import never invents categories", with unmatched rows landing
+ * uncategorised in the needs-fixing queue — but that queue is per-product
+ * with no bulk edit, so a 4,853-row sheet carrying 97 category names put
+ * every single product in it and the catalogue was unusable. Inventing a
+ * category the owner can rename is strictly better than inventing nothing.
  *
  * VARIANT GROUPING (§17): rows sharing productKey collapse into one product;
  * variantAttribute becomes the single axis.
  *
- * MATCHING for update-vs-create (§17): barcode first, then name+variant label.
+ * MATCHING for update-vs-create (§17): barcode first, then name — but see the
+ * comment at the lookup, the name fallback is NOT a catch-all.
  */
 export async function runCommit(tenantId: string, batchId: string): Promise<void> {
   const batch = await ImportBatch.findOne({ _id: batchId, tenantId });
@@ -209,6 +228,45 @@ export async function runCommit(tenantId: string, batchId: string): Promise<void
     const { valid, errors } = await validateRows(rows, batch.columnMap as ColumnMap, tenantId);
 
     const categories = await Category.find({ archivedAt: null });
+    let categoriesCreated = 0;
+    let nextSortOrder = categories.reduce((max, c) => Math.max(max, c.sortOrder ?? 0), 0) + 1;
+
+    /**
+     * Newly created categories are pushed back into `categories` so later rows
+     * fuzzy-match them instead of creating a near-duplicate — that is what
+     * collapses "CHOCOLATE" and "CHOCOLATES" into one aisle for free.
+     *
+     * Created published + visible, unlike the products themselves (which stay
+     * draft per §17). A draft category is invisible to customers, so publishing
+     * the products later would leave them unreachable by browsing — the exact
+     * silent failure this whole change exists to prevent. An empty aisle until
+     * its products are published is the milder of the two.
+     */
+    const resolveCategoryId = async (text: string): Promise<Types.ObjectId | null> => {
+      if (!text) return null;
+
+      const match = categories.find(
+        (c) => fuzzyMatch(c.name.en, text) || fuzzyMatch(c.name.ar, text),
+      );
+      if (match) return match._id;
+
+      const base = slugifyCategory(text);
+      let slug = base;
+      for (let n = 2; await Category.exists({ slug }); n += 1) slug = `${base}-${n}`;
+
+      const created = await Category.create({
+        tenantId,
+        slug,
+        name: { en: text, ar: text },
+        icon: guessCategoryIcon(text),
+        sortOrder: nextSortOrder++,
+        visible: true,
+        status: 'published',
+      });
+      categories.push(created);
+      categoriesCreated += 1;
+      return created._id;
+    };
 
     const grouped = new Map<string, ValidatedRow[]>();
     for (const row of valid) {
@@ -228,13 +286,7 @@ export async function runCommit(tenantId: string, batchId: string): Promise<void
     for (const [, groupRows] of grouped) {
       const first = groupRows[0]!;
 
-      let categoryId: Types.ObjectId | null = null;
-      if (first.categoryText) {
-        const match = categories.find(
-          (c) => fuzzyMatch(c.name.en, first.categoryText) || fuzzyMatch(c.name.ar, first.categoryText),
-        );
-        if (match) categoryId = match._id;
-      }
+      const categoryId = await resolveCategoryId(first.categoryText);
 
       const variants = groupRows.map((r) => ({
         optionIds: {},
@@ -243,15 +295,22 @@ export async function runCommit(tenantId: string, batchId: string): Promise<void
         stock: 'available' as const,
       }));
 
-      // Match: barcode first.
-      let existing = null;
+      /**
+       * Barcode is the only identity we trust. The name fallback applies ONLY
+       * when the group carries no barcode at all.
+       *
+       * It used to run whenever the barcode lookup missed, which quietly
+       * corrupted data: a sheet listing the same item twice under two codes
+       * ("000001346923" and "1346923", same Description) matched the second
+       * group to the first product by name and overwrote its variants — so the
+       * first barcode vanished and the till could no longer scan it. A barcode
+       * that matches nothing means a NEW product, not a rename.
+       */
       const barcodes = groupRows.map((r) => r.barcode).filter(Boolean) as string[];
-      if (barcodes.length > 0) {
-        existing = await Product.findOne({ 'variants.barcode': { $in: barcodes } });
-      }
-      if (!existing) {
-        existing = await Product.findOne({ 'name.en': first.nameEn });
-      }
+      const existing =
+        barcodes.length > 0
+          ? await Product.findOne({ 'variants.barcode': { $in: barcodes } })
+          : await Product.findOne({ 'name.en': first.nameEn });
 
       const searchTokens = buildSearchTokens([
         first.nameEn,
@@ -260,7 +319,23 @@ export async function runCommit(tenantId: string, batchId: string): Promise<void
       ]);
 
       if (existing) {
-        existing.variants = variants as never;
+        // Merge, never replace. `existing.variants = variants` discarded every
+        // variant the product already had, so re-importing a weekly price sheet
+        // silently dropped any size/flavour not present in that week's file —
+        // along with its barcode and stock state. Match on barcode; a
+        // barcode-less incoming row updates the barcode-less variant if there
+        // is one, rather than piling up duplicates on every import.
+        for (const incoming of variants) {
+          const target = incoming.barcode
+            ? existing.variants.find((v) => v.barcode === incoming.barcode)
+            : existing.variants.find((v) => !v.barcode);
+          if (target) {
+            target.price = incoming.price;
+            target.stock = incoming.stock;
+          } else {
+            existing.variants.push(incoming as never);
+          }
+        }
         existing.categoryId = categoryId ?? existing.categoryId;
         existing.searchTokens = searchTokens;
         existing.importBatchId = batch._id;
@@ -289,6 +364,11 @@ export async function runCommit(tenantId: string, batchId: string): Promise<void
     batch.status = 'done';
     await batch.save();
 
+    logger.info(
+      { batchId, tenantId, created, updated, skipped, categoriesCreated },
+      'Import commit finished',
+    );
+
     // §17 RULE — one audit row per import, with the batch stats, not one per product.
     await AuditLog.create({
       tenantId,
@@ -302,7 +382,12 @@ export async function runCommit(tenantId: string, batchId: string): Promise<void
       // "failed" even though the import had fully succeeded.
       collectionName: 'importBatches',
       documentId: batch._id,
-      changes: { stats: { before: null, after: batch.stats } },
+      changes: {
+        stats: { before: null, after: batch.stats },
+        // Import can now create categories, which is a catalogue-shape change
+        // the owner did not make by hand — it belongs in the audit trail.
+        categoriesCreated: { before: 0, after: categoriesCreated },
+      },
     });
   } catch (err) {
     logger.error({ err, batchId }, 'Import commit failed');

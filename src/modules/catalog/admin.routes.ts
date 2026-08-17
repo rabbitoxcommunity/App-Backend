@@ -18,6 +18,11 @@ adminCatalogRouter.get(
   asyncHandler(controller.adminListCategories),
 );
 adminCatalogRouter.get(
+  '/categories/:id',
+  requireRole('storeAdmin', 'staff'),
+  asyncHandler(controller.adminGetCategory),
+);
+adminCatalogRouter.get(
   '/products',
   requireRole('storeAdmin', 'staff'),
   asyncHandler(controller.adminListProducts),
@@ -28,6 +33,14 @@ adminCatalogRouter.post(
   requireRole('storeAdmin', 'manager'),
   validate({ body: controller.categoryBodySchema }),
   asyncHandler(controller.createCategory),
+);
+// Registered BEFORE '/categories/:id' — Express matches in registration
+// order and the :id pattern would otherwise swallow '/position'.
+adminCatalogRouter.patch(
+  '/categories/:id/position',
+  requireRole('storeAdmin', 'manager'),
+  validate({ body: controller.categoryPositionSchema }),
+  asyncHandler(controller.setCategoryPosition),
 );
 adminCatalogRouter.patch(
   '/categories/:id',
