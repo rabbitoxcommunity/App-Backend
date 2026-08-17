@@ -16,6 +16,12 @@ export const listProductsQuery = paginationQuery.extend({
   sort: z.enum(['popularity', 'newest', 'priceAsc', 'priceDesc']).optional(),
   minPrice: z.coerce.number().optional(),
   maxPrice: z.coerce.number().optional(),
+  // The storefront's default listing hides sold-out rows; doing it server-side
+  // keeps `total` honest and stops out-of-stock items consuming page slots.
+  inStock: z
+    .enum(['true', 'false'])
+    .optional()
+    .transform((v) => (v === undefined ? undefined : v === 'true')),
 });
 
 export const searchQuery = paginationQuery.extend({ q: z.string().min(1) });

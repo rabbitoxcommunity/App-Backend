@@ -71,8 +71,13 @@ export async function listProducts(opts: {
   sort?: string;
   minPrice?: number;
   maxPrice?: number;
+  inStock?: boolean;
 }) {
   const filter: FilterQuery<typeof Product> = { status: 'published', archivedAt: null };
+  // Matches products with AT LEAST ONE sellable variant, mirroring the app's
+  // productStock()/isPurchasable() rule. A plain { $ne: 'out' } would instead
+  // demand that NO variant is out, hiding partially-out products.
+  if (opts.inStock) filter['variants.stock'] = { $in: ['available', 'low'] };
   if (opts.category) {
     filter.categoryId = Types.ObjectId.isValid(opts.category) ? opts.category : undefined;
     if (!filter.categoryId) {
