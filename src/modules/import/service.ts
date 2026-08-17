@@ -20,7 +20,13 @@ async function fetchWorkbook(fileUrl: string): Promise<XLSX.WorkBook> {
     throw new AppError('VALIDATION_FAILED', `Could not fetch the uploaded file (${response.status}).`);
   }
   const buffer = Buffer.from(await response.arrayBuffer());
-  return XLSX.read(buffer, { type: 'buffer' });
+  // codepage 65001 = UTF-8. Without it SheetJS decodes CSV bytes with a
+  // legacy single-byte codepage, so Arabic arrives as mojibake
+  // ("أرز" -> "Ø£Ø±Ø²"). That is not cosmetic here: a product needs a real
+  // Arabic name to be publishable at all (§4 Localized rule), so every
+  // imported row was effectively unpublishable. XLSX files carry their own
+  // encoding and are unaffected, but passing this is harmless for them.
+  return XLSX.read(buffer, { type: 'buffer', codepage: 65001 });
 }
 
 function sheetToRows(workbook: XLSX.WorkBook): Record<string, unknown>[] {
@@ -289,7 +295,12 @@ export async function runCommit(tenantId: string, batchId: string): Promise<void
       actorId: batch.uploadedBy,
       actorRole: 'storeAdmin',
       action: 'import.commit',
-      collection: 'importBatches',
+      // `collectionName`, not `collection` — the latter shadows Mongoose's
+      // reserved Document property and is NOT the schema field, so this write
+      // failed the required-field check. It threw after the products had
+      // already been created, and the catch below then marked the whole batch
+      // "failed" even though the import had fully succeeded.
+      collectionName: 'importBatches',
       documentId: batch._id,
       changes: { stats: { before: null, after: batch.stats } },
     });

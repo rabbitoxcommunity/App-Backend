@@ -1,8 +1,10 @@
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { randomUUID } from 'node:crypto';
+import type { Types } from 'mongoose';
 import { env } from '../config/env.js';
 import { AppError } from './errors.js';
+import { Tenant } from '../models/Tenant.js';
 
 /**
  * §16 FILE UPLOAD — presigned direct-to-storage PUT. Bytes never pass
@@ -46,7 +48,19 @@ const extensionFor: Record<string, string> = {
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
 };
 
-/** §16 — path is `<tenantId>/<purpose>/<uuid>.<ext>`, so storage is auditable and deletable per tenant. */
+/**
+ * Tenant slugs are unique, URL-safe and stable enough (only owners can
+ * rename a shop, and rarely do) to double as the storage folder name — far
+ * more legible than a bare ObjectId when browsing the bucket by hand.
+ * Falls back to the id itself if the tenant can't be found, so a bad lookup
+ * never blocks an upload.
+ */
+async function resolveTenantFolder(tenantId: string): Promise<string> {
+  const tenant = await Tenant.findById(tenantId as unknown as Types.ObjectId).select('slug').lean();
+  return tenant?.slug ?? tenantId;
+}
+
+/** §16 — path is `<tenantSlug>/<purpose>/<uuid>.<ext>`, so storage is auditable and deletable per tenant. */
 export async function signUpload(
   tenantId: string,
   contentType: string,
@@ -57,7 +71,8 @@ export async function signUpload(
     throw AppError.validationFailed({ contentType: `Not allowed for purpose "${purpose}".` });
   }
 
-  const key = `${tenantId}/${purpose}/${randomUUID()}.${extensionFor[contentType]}`;
+  const folder = await resolveTenantFolder(tenantId);
+  const key = `${folder}/${purpose}/${randomUUID()}.${extensionFor[contentType]}`;
 
   const command = new PutObjectCommand({
     Bucket: env.S3_BUCKET,

@@ -158,7 +158,10 @@ export async function impersonate(tenantId: string, superAdminId: Types.ObjectId
     actorId: superAdminId,
     actorRole: 'superAdmin',
     action: 'platform.impersonate',
-    collection: 'tenants',
+    // `collectionName` is the schema field; `collection` silently isn't, so
+    // this required-field write threw — losing the audit row for the single
+    // most sensitive action in the platform, after the session was issued.
+    collectionName: 'tenants',
     documentId: tenantId,
     changes: {},
   });
