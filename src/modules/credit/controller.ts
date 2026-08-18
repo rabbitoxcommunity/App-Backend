@@ -11,7 +11,10 @@ const paginationQuery = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(20),
 });
 
-export const approveCreditSchema = z.object({ limit: z.number().int().min(0) });
+// `limit: null` is an explicit grant of UNLIMITED credit, not a missing
+// value — hence .nullable() rather than .optional(), so it has to be sent
+// deliberately and can never be produced by forgetting the field.
+export const approveCreditSchema = z.object({ limit: z.number().int().min(0).nullable() });
 export const paymentSchema = z.object({ amount: z.number().int().positive() });
 
 // ------------------------------------------------------------- customer
@@ -74,6 +77,17 @@ export async function recordPayment(req: Request, res: Response): Promise<void> 
   );
   realtime.creditChanged(String(req.ctx.tenantId), req.params.customerId!, account);
   res.status(201).json(entry);
+}
+
+/** One customer's account, so the Admin edit dialog can prefill the current limit. */
+export async function adminGetAccount(req: Request, res: Response): Promise<void> {
+  res.json(
+    await service.getAccount(req.ctx.tenantId!, new mongoose.Types.ObjectId(req.params.customerId!)),
+  );
+}
+
+export async function revoke(req: Request, res: Response): Promise<void> {
+  res.json(await service.revokeCredit(req.ctx.tenantId!, req.params.id!));
 }
 
 export async function exposure(req: Request, res: Response): Promise<void> {

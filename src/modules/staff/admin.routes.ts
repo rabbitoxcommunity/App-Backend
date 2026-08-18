@@ -85,12 +85,21 @@ adminStaffRouter.post(
   }),
 );
 
+// Hard delete — the row is gone. Suspending someone instead is a PATCH with
+// `status: 'blocked'`. deleteStaff returns the name and role it removed
+// precisely so the audit entry can still name who was deleted; by the time
+// this handler runs there is no row left to read them from.
 adminStaffRouter.delete(
   '/:id',
   requireRole('storeAdmin', 'owner'),
   asyncHandler(async (req, res) => {
-    const member = await service.deactivateStaff(req.ctx.tenantId!, req.params.id!);
-    await writeAudit(req, 'staff.deactivate', 'users', req.params.id!);
-    res.json(member);
+    const deleted = await service.deleteStaff(req.ctx.tenantId!, req.params.id!, {
+      userId: req.ctx.userId!,
+    });
+    await writeAudit(req, 'staff.delete', 'users', req.params.id!, {
+      name: { before: deleted.name, after: null },
+      role: { before: deleted.role, after: null },
+    });
+    res.json(deleted);
   }),
 );

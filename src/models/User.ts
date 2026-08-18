@@ -68,7 +68,20 @@ const userSchema = new Schema(
   { timestamps: true },
 );
 
-userSchema.index({ tenantId: 1, phone: 1 }, { unique: true });
+// Phone is unique for CUSTOMERS ONLY. A customer is identified by their
+// phone alone — the OTP flow looks them up by it and creates one if absent —
+// so two customers sharing a number would be genuinely ambiguous.
+//
+// Staff are not. A small supermarket may have exactly one phone number for
+// the whole shop, shared by every rider and manager on the roster, and
+// refusing to register them was a real blocker. Neither staff role
+// authenticates on the phone by itself: a storeAdmin signs in with an email
+// (unique, see below) and a deliveryStaff with phone + PASSWORD, which
+// modules/staff/service.ts keeps distinct among everyone sharing a number.
+userSchema.index(
+  { tenantId: 1, phone: 1 },
+  { unique: true, partialFilterExpression: { role: 'customer' } },
+);
 // `sparse: true` alone is NOT enough here: a sparse index only excludes
 // documents where the field is entirely absent, not documents where it is
 // explicitly `null` — and `email` above defaults to `null` for every

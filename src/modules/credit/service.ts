@@ -34,7 +34,18 @@ export async function appendLedgerEntry(input: AppendEntryInput, session: Client
     throw new AppError('CREDIT_NOT_APPROVED', 'This customer has no credit account.');
   }
 
-  if (input.kind === 'charge' && account.balance + input.amount > account.limit) {
+  // Only CHARGES are blocked on a revoked account. A payment must always be
+  // allowed through: withdrawing someone's credit does not clear what they
+  // already owe, and refusing to record their repayment would strand the
+  // balance for ever — including a rider collecting cash at the door.
+  if (!account.active && input.kind === 'charge') {
+    throw new AppError('CREDIT_NOT_APPROVED', 'Credit has been disabled for this customer.');
+  }
+
+  // A null limit is unlimited, so there is no ceiling to breach. Written as
+  // an explicit null check rather than relying on comparison: `x > null`
+  // coerces null to 0 in JS, which would reject every single charge.
+  if (input.kind === 'charge' && account.limit != null && account.balance + input.amount > account.limit) {
     throw new AppError('CREDIT_LIMIT_EXCEEDED', 'This charge would exceed the credit limit.', {
       limit: account.limit,
       currentBalance: account.balance,
@@ -99,10 +110,11 @@ export async function listEntries(
 }
 
 /** §4.13/§19.1 — a new customer's credit account, created when a manager approves them. */
+/** `limit` of null grants unlimited credit — see models/CreditAccount.ts. */
 export async function approveCredit(
   tenantId: Types.ObjectId,
   customerId: string,
-  limit: number,
+  limit: number | null,
   approvedBy: Types.ObjectId,
 ) {
   const customer = await User.findOne({ _id: customerId, tenantId, role: 'customer' });
@@ -116,9 +128,39 @@ export async function approveCredit(
 
   const account = await CreditAccount.findOneAndUpdate(
     { tenantId, customerId },
-    { limit, dueDate, approvedBy, approvedAt: new Date() },
+    // `active: true` matters on re-approval as much as on the first grant —
+    // this is also the path that restores credit to a customer it was
+    // withdrawn from, and their old account row is still sitting there
+    // inactive.
+    { limit, dueDate, approvedBy, approvedAt: new Date(), active: true },
     { upsert: true, new: true, setDefaultsOnInsert: true },
   );
+  return account;
+}
+
+/**
+ * Withdraw credit. Deliberately NOT a delete: the account and every ledger
+ * entry stay, because a customer whose credit is pulled usually still owes
+ * something, and the shop needs the history to chase it. What changes is
+ * that no new charge can be raised against it.
+ *
+ * `creditApproved` on the User is cleared too — that flag is what the
+ * customer app reads to decide whether to offer Pay Later at all, so without
+ * it the option would keep appearing and only fail at checkout.
+ */
+export async function revokeCredit(tenantId: Types.ObjectId, customerId: string) {
+  const customer = await User.findOne({ _id: customerId, tenantId, role: 'customer' });
+  if (!customer) throw AppError.notFound('Customer');
+
+  const account = await CreditAccount.findOne({ tenantId, customerId });
+  if (!account) throw new AppError('CREDIT_NOT_APPROVED', 'This customer has no credit account.');
+
+  customer.creditApproved = false;
+  await customer.save();
+
+  account.active = false;
+  await account.save();
+
   return account;
 }
 

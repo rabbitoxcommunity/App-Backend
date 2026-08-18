@@ -10,6 +10,7 @@ export const adminCreditRouter = Router();
 adminCreditRouter.use(requireRole('storeAdmin', 'manager'));
 
 adminCreditRouter.get('/', asyncHandler(controller.exposure));
+adminCreditRouter.get('/:customerId', asyncHandler(controller.adminGetAccount));
 adminCreditRouter.get('/:customerId/entries', asyncHandler(controller.adminEntries));
 adminCreditRouter.post(
   '/:customerId/payment',

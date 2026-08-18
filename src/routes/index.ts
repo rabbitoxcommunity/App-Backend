@@ -25,6 +25,10 @@ apiRouter.use('/', catalogRouter);
 apiRouter.use('/admin', adminCatalogRouter);
 apiRouter.use('/admin/import', importRouter);
 apiRouter.use('/admin/uploads', uploadsRouter);
+// Same router, unprefixed — delivery staff sign `delivery-proof` uploads here
+// and have no business on an /admin path. Authorisation is per-purpose inside
+// the router, so the two mounts are equally safe.
+apiRouter.use('/uploads', uploadsRouter);
 
 // Phase 3 — cart, promos, orders
 import { cartRouter } from '../modules/cart/routes.js';

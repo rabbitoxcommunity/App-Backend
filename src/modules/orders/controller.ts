@@ -163,9 +163,12 @@ export async function adminAssignRider(req: Request, res: Response): Promise<voi
 
 export async function adminRefund(req: Request, res: Response): Promise<void> {
   // §9.7 — refunds are recorded, not executed; there is no gateway in v1 (D12).
+  // The service now actually marks the order refunded; this used to write an
+  // audit row and return the order unchanged, so nothing in the product could
+  // tell a refunded order from an unrefunded one.
+  const order = await service.refundOrder(req.ctx.tenantId!, req.params.id!);
   await writeAudit(req, 'order.refund', 'orders', req.params.id!, {
     note: { before: null, after: req.body.reason ?? '' },
   });
-  const order = await service.getOrder(req.ctx.tenantId!, req.params.id!);
   res.json(order);
 }

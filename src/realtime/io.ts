@@ -66,6 +66,11 @@ export function attachSocketServer(server: HttpServer): Server {
     }
     if (role === 'deliveryStaff') {
       socket.join(`rider:${userId}`);
+      // Every rider also joins a shared room. Orders are no longer allocated
+      // to an individual — they land in an open pool that the whole roster
+      // competes for — so "a new order exists" and "somebody took one" have
+      // to reach all of them, not just whoever it was assigned to.
+      socket.join('riders');
     }
     // Credit balance is private — only this customer's own connections (and
     // the admin queue) should receive `credit.changed`.
@@ -116,15 +121,28 @@ function customerRoom(order: unknown): string | null {
 export const realtime = {
   orderCreated(tenantId: string, order: unknown): void {
     const rooms = ['queue', customerRoom(order)].filter(Boolean) as string[];
+    // A new delivery order is immediately pickable by any rider, so the whole
+    // roster needs to see it land. Curbside never involves a rider.
+    if ((order as { fulfillment?: string } | null)?.fulfillment === 'delivery') {
+      rooms.push('riders');
+    }
     nsp(tenantId)?.to(rooms).emit('order.created', order);
   },
   orderStatus(tenantId: string, orderId: string, riderId: string | null, order: unknown): void {
     const rooms = ['queue', `order:${orderId}`, customerRoom(order)].filter(Boolean) as string[];
     if (riderId) rooms.push(`rider:${riderId}`);
+    // An unclaimed order changing status (the shop packing it, or cancelling
+    // it) changes what the pool shows everyone.
+    if (!riderId && (order as { fulfillment?: string } | null)?.fulfillment === 'delivery') {
+      rooms.push('riders');
+    }
     nsp(tenantId)?.to(rooms).emit('order.status', order);
   },
   orderAssigned(tenantId: string, riderId: string, order: unknown): void {
-    const rooms = ['queue', `rider:${riderId}`, customerRoom(order)].filter(Boolean) as string[];
+    // `riders` rather than just the one who got it: everyone else is looking
+    // at a pool this order has just left, and a stale entry there means two
+    // riders driving to the same address.
+    const rooms = ['queue', 'riders', customerRoom(order)].filter(Boolean) as string[];
     nsp(tenantId)?.to(rooms).emit('order.assigned', order);
   },
   orderArrived(tenantId: string, order: unknown): void {

@@ -36,6 +36,8 @@ adminCustomersRouter.patch(
   validate({ body: creditController.approveCreditSchema }),
   asyncHandler(creditController.approve),
 );
+// Withdraw credit. The account and its ledger survive — see revokeCredit.
+adminCustomersRouter.delete('/:id/credit', asyncHandler(creditController.revoke));
 
 adminCustomersRouter.patch(
   '/:id/block',

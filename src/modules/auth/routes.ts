@@ -29,6 +29,15 @@ authRouter.post(
   asyncHandler(controller.staffLogin),
 );
 
+// Delivery staff use the phone + password their store admin set on the Admin
+// staff screen. Keyed per phone rather than per email — a rider has no email.
+authRouter.post(
+  '/delivery/login',
+  validate({ body: controller.deliveryLoginSchema }),
+  rateLimit({ windowSeconds: 900, max: 10, keyFn: byPhone }),
+  asyncHandler(controller.deliveryLogin),
+);
+
 authRouter.post(
   '/platform/login',
   validate({ body: controller.platformLoginSchema }),

@@ -11,7 +11,7 @@ import { generateOrderReference } from '../../lib/reference.js';
 import { generateConfirmationCode } from '../../lib/crypto.js';
 import { verifyPriceToken } from '../../lib/priceToken.js';
 import { canTransition, type OrderStatus } from '../../lib/orderFlow.js';
-import { assignRider, acceptAssignment } from './rider.js';
+import { acceptAssignment } from './rider.js';
 import { realtime } from '../../realtime/io.js';
 import { decodeCursor, encodeCursor, cursorFilter } from '../../lib/cursorPagination.js';
 import { Tenant } from '../../models/Tenant.js';
@@ -171,10 +171,17 @@ export async function placeOrder(
   }
 
   // Outside the transaction — network I/O and non-critical side effects.
+  //
+  // NO AUTOMATIC RIDER ALLOCATION. A new delivery order goes into an open
+  // pool and stays unassigned until a rider claims it themselves (see
+  // claimOrder below). This replaces the workload-based auto-assignment that
+  // used to run here: a shop with a couple of drivers who can see each
+  // other and the shelves picks better than a heuristic can, and the old
+  // model had orders stranded whenever nobody happened to be `available`.
+  //
+  // Managers can still direct a specific order at a specific rider from the
+  // dashboard — see manualAssignRider.
   realtime.orderCreated(String(tenantId), order.toJSON());
-  if (order.fulfillment === 'delivery') {
-    await assignRider(tenantId, order._id);
-  }
 
   return order;
 }
@@ -199,7 +206,7 @@ async function uniqueReference(
  * the customer's name and phone prominently, but Order only stores
  * customerId. Batch-join rather than N+1: one User query per page of orders.
  */
-async function withCustomerInfo<T extends { customerId: Types.ObjectId }>(
+export async function withCustomerInfo<T extends { customerId: Types.ObjectId }>(
   orders: T[],
 ): Promise<Array<T & { customer: { name: string; phone: string } | null }>> {
   if (orders.length === 0) return [];
@@ -312,10 +319,29 @@ export async function transitionStatus(
   await order.save();
 
   if (order.fulfillment === 'delivery' && order.rider?.userId && (targetStatus === 'delivered' || targetStatus === 'cancelled')) {
-    await User.findByIdAndUpdate(order.rider.userId, {
-      $pull: { activeOrderIds: order._id },
-      $inc: { 'stats.completedToday': targetStatus === 'delivered' ? 1 : 0 },
-    });
+    const rider = await User.findByIdAndUpdate(
+      order.rider.userId,
+      {
+        $pull: { activeOrderIds: order._id },
+        $inc: { 'stats.completedToday': targetStatus === 'delivered' ? 1 : 0 },
+      },
+      { new: true },
+    );
+
+    // §9.5 — hand the rider back to the assignment pool once their hands are
+    // empty. Without this they stay `on_delivery` for ever: the order is
+    // pulled off activeOrderIds but availability is never reset, and
+    // selectAndClaimRider only ever matches `available`. One completed
+    // delivery was enough to take a rider out of rotation permanently, and
+    // once every rider had done one, new orders stopped being assigned to
+    // anybody at all.
+    //
+    // `off_shift` is left alone on purpose — a rider who clocked out while
+    // holding their last order must not be dragged back on by finishing it.
+    if (rider && rider.availability === 'on_delivery' && rider.activeOrderIds.length === 0) {
+      rider.availability = 'available';
+      await rider.save();
+    }
   }
 
   realtime.orderStatus(String(tenantId), String(order._id), order.rider?.userId ? String(order.rider.userId) : null, order.toJSON());
@@ -354,9 +380,105 @@ export async function setArrival(
   return order;
 }
 
+/**
+ * OPEN POOL — a rider claims an unassigned order for themselves.
+ *
+ * The whole thing hangs on one atomic `findOneAndUpdate` with
+ * `'rider.userId': null` IN THE FILTER. That predicate is the lock: when two
+ * riders tap the same order at the same moment, MongoDB applies one update
+ * and the other's filter no longer matches, so it returns null and that
+ * rider is told someone beat them to it. Reading the order first and then
+ * writing would let both through.
+ */
+export async function claimOrder(
+  tenantId: Types.ObjectId,
+  orderId: string,
+  riderId: Types.ObjectId,
+): Promise<OrderDoc> {
+  const rider = await User.findOne({ _id: riderId, tenantId, role: 'deliveryStaff' });
+  if (!rider) throw AppError.notFound('Rider');
+  if (rider.status !== 'active') {
+    throw new AppError('ACCOUNT_BLOCKED', 'This account is not active.');
+  }
+
+  const tenant = await Tenant.findById(tenantId);
+
+  const order = await Order.findOneAndUpdate(
+    {
+      _id: orderId,
+      tenantId,
+      fulfillment: 'delivery',
+      'rider.userId': null,
+      status: { $nin: ['delivered', 'handed_over', 'cancelled'] },
+    },
+    {
+      $set: {
+        rider: {
+          userId: rider._id,
+          name: { en: rider.name, ar: rider.name },
+          phone: rider.phone,
+          etaMinutes: tenant?.settings!.deliveryEtaMinutes ?? 30,
+        },
+        'assignment.assignedAt': new Date(),
+        // A claim IS the acceptance — there is no offer to time out any more.
+        'assignment.acceptedAt': new Date(),
+        'assignment.needsManualAssignment': false,
+      },
+    },
+    { new: true },
+  );
+
+  if (!order) {
+    // Either another rider got there first, or it was cancelled/delivered
+    // meanwhile. Both read the same way to whoever tapped.
+    throw AppError.conflict('Another driver has already taken this order.');
+  }
+
+  await User.findByIdAndUpdate(rider._id, {
+    availability: 'on_delivery',
+    $addToSet: { activeOrderIds: order._id },
+  });
+
+  realtime.orderAssigned(String(tenantId), String(rider._id), order.toJSON());
+  domainEvents.emit('order.assigned', { tenantId: String(tenantId), order, riderId: String(rider._id) });
+
+  return order;
+}
+
 export async function acceptRiderOffer(tenantId: Types.ObjectId, orderId: string, riderId: Types.ObjectId) {
   const order = await acceptAssignment(tenantId, orderId, riderId);
   if (!order) throw AppError.notFound('Assignment');
+  return order;
+}
+
+/**
+ * §9.7 — records a refund. It does NOT move money: there is no payment gateway
+ * in v1 (D12), so the actual return is done by hand in the provider's dashboard
+ * and this marks the order so the books and the Insights figures agree.
+ *
+ * Previously the endpoint only wrote an audit row and returned the order
+ * untouched, so a refunded order was indistinguishable from an unrefunded one
+ * anywhere in the product.
+ */
+export async function refundOrder(
+  tenantId: Types.ObjectId,
+  orderId: string,
+): Promise<OrderDoc> {
+  const order = await Order.findOne({ _id: orderId, tenantId });
+  if (!order) throw AppError.notFound('Order');
+
+  if (order.paymentStatus !== 'collected') {
+    throw new AppError(
+      'INVALID_TRANSITION',
+      order.paymentStatus === 'refunded'
+        ? 'This order has already been refunded.'
+        : `Nothing to refund — payment was never collected (status "${order.paymentStatus}").`,
+    );
+  }
+
+  order.paymentStatus = 'refunded';
+  await order.save();
+  realtime.orderStatus(String(tenantId), String(order._id), null, order.toJSON());
   return order;
 }
 
@@ -377,15 +499,23 @@ export async function cancelOrder(
       const found = await Order.findOne({ _id: orderId, tenantId }).session(session);
       if (!found) throw AppError.notFound('Order');
 
-      if (actor.role === 'customer') {
-        if (String(found.customerId) !== String(actor.userId)) throw AppError.forbidden();
-        if (found.status !== 'placed') {
-          throw new AppError('INVALID_TRANSITION', 'This order can no longer be cancelled — it is already being packed.');
-        }
-      } else {
-        if (!['placed', 'packed'].includes(found.status)) {
-          throw new AppError('INVALID_TRANSITION', `Cannot cancel an order that is "${found.status}".`);
-        }
+      // Customers and managers now share the same window: `placed` or `packed`.
+      // Customer-cancel used to stop at `placed`, which on a shop that starts
+      // packing within a minute meant nearly every real attempt was refused and
+      // the customer had to phone anyway — the self-serve path existed but
+      // almost never applied. Once a rider has it (`out_for_delivery`) or it is
+      // waiting at the bay, cancelling is a conversation, not a button.
+      const CANCELLABLE = ['placed', 'packed'];
+      if (actor.role === 'customer' && String(found.customerId) !== String(actor.userId)) {
+        throw AppError.forbidden();
+      }
+      if (!CANCELLABLE.includes(found.status)) {
+        throw new AppError(
+          'INVALID_TRANSITION',
+          found.status === 'cancelled'
+            ? 'This order has already been cancelled.'
+            : `This order can no longer be cancelled — it is already "${found.status}".`,
+        );
       }
 
       found.status = 'cancelled';
@@ -393,6 +523,20 @@ export async function cancelOrder(
       found.cancelReason = reason;
       found.cancelledBy = actor.userId;
       found.events.push({ status: 'cancelled', at: new Date(), byUserId: actor.userId });
+
+      /**
+       * Money already taken has to be given back, and the record has to say so.
+       *
+       * There is no payment gateway in v1 (§9.7 / D12), so nothing here moves
+       * money — a card order is never charged at all, and its paymentStatus
+       * stays `pending` for life. Marking `refunded` only when the payment was
+       * actually `collected` keeps the field truthful today (a cancelled,
+       * never-charged order is not "refunded"), and becomes correct on its own
+       * the day a gateway starts setting `collected` at capture time.
+       */
+      if (found.paymentStatus === 'collected') {
+        found.paymentStatus = 'refunded';
+      }
 
       // §9.7 — cancelling a credit order writes a compensating entry in the SAME transaction.
       if (found.paymentKind === 'credit') {
@@ -504,37 +648,103 @@ export async function updateOrderLines(
 // -------------------------------------------------------------- confirmation
 
 /** §9.4 — required for `delivered` and `handed_over`. Captures proof of delivery. */
+/**
+ * §9 — the rider's one write that closes an order out: proves the code,
+ * records the proof (photo + GPS), banks whatever money changed hands, and
+ * only then moves the status.
+ *
+ * The three payment kinds behave differently at the door:
+ *   card   — already paid online. Nothing to collect; an amount is a bug.
+ *   cash   — the full order total is due, exactly. Enforced.
+ *   credit — the ledger was ALREADY charged when the order was placed
+ *            (§13.2, inside placeOrder's transaction). So the money is not
+ *            due at the door and `amountCollected` is optional. When the
+ *            customer does hand over cash it is a repayment against their
+ *            account, written as a `payment` entry (negative amount), NOT a
+ *            second charge — the balance goes down, it does not double.
+ */
 export async function confirmDelivery(
   tenantId: Types.ObjectId,
   orderId: string,
-  input: { code: string; photoUrl: string; geo?: { lat: number; lng: number }; amountCollected?: number },
+  input: { code: string; photoUrl?: string; geo?: { lat: number; lng: number }; amountCollected?: number },
   actor: { userId: Types.ObjectId },
 ): Promise<OrderDoc> {
-  const order = await Order.findOne({ _id: orderId, tenantId });
-  if (!order) throw AppError.notFound('Order');
+  const existing = await Order.findOne({ _id: orderId, tenantId });
+  if (!existing) throw AppError.notFound('Order');
 
-  if (order.confirmationCode !== input.code) {
+  if (existing.confirmationCode !== input.code) {
     throw new AppError('VALIDATION_FAILED', 'Confirmation code does not match.');
   }
-  if (order.paymentKind === 'cash') {
-    if (input.amountCollected == null || input.amountCollected !== order.total) {
+
+  const collected = input.amountCollected ?? null;
+
+  if (existing.paymentKind === 'cash') {
+    if (collected == null || collected !== existing.total) {
       throw new AppError('AMOUNT_MISMATCH', 'The amount collected does not match the order total.', {
-        expected: order.total,
-        received: input.amountCollected ?? null,
+        expected: existing.total,
+        received: collected,
+      });
+    }
+  } else if (existing.paymentKind === 'card') {
+    if (collected != null && collected !== 0) {
+      throw new AppError('AMOUNT_MISMATCH', 'A card order is already paid — nothing is collected at the door.', {
+        expected: 0,
+        received: collected,
+      });
+    }
+  } else if (collected != null) {
+    // A repayment larger than the order it was taken against is a
+    // back-office settlement, not a doorstep one — the rider is not
+    // carrying that much reconciliation.
+    if (collected <= 0 || collected > existing.total) {
+      throw new AppError('AMOUNT_MISMATCH', 'A credit repayment must be between 0 and the order total.', {
+        expected: existing.total,
+        received: collected,
       });
     }
   }
 
-  order.proof = {
-    code: true,
-    photoUrl: input.photoUrl,
-    geo: input.geo,
-    amountCollected: input.amountCollected ?? null,
-  };
-  if (order.paymentKind === 'cash') order.paymentStatus = 'collected';
-  await order.save();
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const order = await Order.findOne({ _id: orderId, tenantId }).session(session);
+      if (!order) throw AppError.notFound('Order');
 
-  const targetStatus: OrderStatus = order.fulfillment === 'delivery' ? 'delivered' : 'handed_over';
+      order.proof = {
+        code: true,
+        photoUrl: input.photoUrl ?? null,
+        geo: input.geo,
+        amountCollected: collected,
+      };
+      if (order.paymentKind === 'cash') order.paymentStatus = 'collected';
+
+      if (order.paymentKind === 'credit' && collected != null) {
+        await appendLedgerEntry(
+          {
+            tenantId,
+            customerId: order.customerId,
+            kind: 'payment',
+            title: { en: 'Payment collected on delivery', ar: 'تم تحصيل الدفعة عند التسليم' },
+            subtitle: { en: `Order ${order.reference}`, ar: `طلب ${order.reference}` },
+            amount: -collected,
+            orderId: order._id,
+            recordedBy: actor.userId,
+          },
+          session,
+        );
+        order.paymentStatus = 'collected';
+      }
+
+      await order.save({ session });
+    });
+  } finally {
+    await session.endSession();
+  }
+
+  // Outside the transaction on purpose: transitionStatus emits sockets and
+  // domain events, and the codebase's rule is that no network I/O runs
+  // inside one.
+  const targetStatus: OrderStatus = existing.fulfillment === 'delivery' ? 'delivered' : 'handed_over';
   return transitionStatus(tenantId, orderId, targetStatus, { userId: actor.userId, role: 'deliveryStaff' });
 }
 
@@ -584,6 +794,10 @@ export async function manualAssignRider(
   order.rider = { userId: rider._id, name: { en: rider.name, ar: rider.name }, phone: rider.phone, etaMinutes: order.rider?.etaMinutes ?? 30 };
   order.assignment!.assignedAt = new Date();
   order.assignment!.acceptedAt = null;
+  // Placing it by hand IS the manual assignment this flag was asking for.
+  // Leaving it set would keep the order flagged as needing attention in the
+  // dashboard for ever, even though a rider now has it.
+  order.assignment!.needsManualAssignment = false;
   await order.save();
   await User.findByIdAndUpdate(rider._id, { $addToSet: { activeOrderIds: order._id } });
 

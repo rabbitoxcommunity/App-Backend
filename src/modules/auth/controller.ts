@@ -23,6 +23,12 @@ export const staffLoginSchema = z.object({
   password: z.string().min(1),
 });
 
+export const deliveryLoginSchema = z.object({
+  tenantSlug: z.string().min(1),
+  phone: z.string().min(6),
+  password: z.string().min(1),
+});
+
 export const platformLoginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(1),
@@ -70,6 +76,16 @@ export async function staffLogin(req: Request, res: Response): Promise<void> {
   const { user, accessToken, refreshToken } = await authService.staffLogin(
     req.body.tenantSlug,
     req.body.email,
+    req.body.password,
+    { userAgent: req.headers['user-agent'], ip: req.ip },
+  );
+  res.status(200).json({ accessToken, refreshToken, user: user.toJSON() });
+}
+
+export async function deliveryLogin(req: Request, res: Response): Promise<void> {
+  const { user, accessToken, refreshToken } = await authService.deliveryLogin(
+    req.body.tenantSlug,
+    req.body.phone,
     req.body.password,
     { userAgent: req.headers['user-agent'], ip: req.ip },
   );

@@ -4,7 +4,10 @@ import { DailyRollup } from '../../models/DailyRollup.js';
 import { SearchLog } from '../../models/SearchLog.js';
 import { Tenant } from '../../models/Tenant.js';
 import { User } from '../../models/User.js';
+import { Product } from '../../models/Product.js';
+import { Category } from '../../models/Category.js';
 import { todayKey, startOfDayInTimezone } from '../../lib/timezone.js';
+import { computeRollup } from '../../jobs/rollups.js';
 
 /** §18 — the ONLY live aggregation; everything historical reads dailyRollups. */
 export async function today(tenantId: Types.ObjectId) {
@@ -24,7 +27,26 @@ export async function today(tenantId: Types.ObjectId) {
   return { date: dateKey, orderCount: orders.length, revenue, byStatus };
 }
 
+
+/**
+ * The nightly job (00:10) only ever rolls up YESTERDAY, so today's orders are
+ * invisible to every rollup-backed panel until tomorrow. On a shop whose orders
+ * are all from today — a new tenant, or any dev/staging box — that reads as
+ * "Best-selling products", "Category performance" and "Delivery vs curbside"
+ * being permanently broken, while the live "today" tile beside them works.
+ *
+ * Recomputing today's rollup when the requested range includes it closes that
+ * gap. computeRollup upserts on (tenantId, date), so calling it repeatedly is
+ * safe and simply refreshes the row.
+ */
+async function refreshTodayIfInRange(tenantId: Types.ObjectId, to: string): Promise<void> {
+  const tenant = await Tenant.findById(tenantId);
+  const key = todayKey(tenant?.locale!.timezone ?? 'Asia/Dubai');
+  if (to >= key) await computeRollup(tenantId, key);
+}
+
 export async function summary(tenantId: Types.ObjectId, from: string, to: string) {
+  await refreshTodayIfInRange(tenantId, to);
   const rollups = await DailyRollup.find({ tenantId, date: { $gte: from, $lte: to } }).sort({ date: 1 });
   const totals = rollups.reduce(
     (acc, r) => ({
@@ -39,6 +61,7 @@ export async function summary(tenantId: Types.ObjectId, from: string, to: string
 }
 
 export async function topProducts(tenantId: Types.ObjectId, from: string, to: string) {
+  await refreshTodayIfInRange(tenantId, to);
   const rollups = await DailyRollup.find({ tenantId, date: { $gte: from, $lte: to } });
   const merged = new Map<string, { units: number; revenue: number }>();
   for (const r of rollups) {
@@ -50,13 +73,25 @@ export async function topProducts(tenantId: Types.ObjectId, from: string, to: st
       merged.set(key, entry);
     }
   }
-  return Array.from(merged.entries())
+  const rows = Array.from(merged.entries())
     .map(([productId, v]) => ({ productId, ...v }))
     .sort((a, b) => b.revenue - a.revenue)
     .slice(0, 20);
+
+  // Names, not just ids. The rows rendered as "7 sold — AED 49" with no
+  // indication of WHICH product, which makes the panel unreadable. Resolved
+  // here in one query rather than N lookups from the browser.
+  const products = await Product.find({ _id: { $in: rows.map((r) => r.productId) } }).select('name');
+  const nameById = new Map(products.map((p) => [String(p._id), p.name]));
+  return rows.map((r) => ({
+    ...r,
+    // A product deleted since the sale still has to render — order history keeps it.
+    name: nameById.get(r.productId) ?? { en: 'Deleted product', ar: 'Deleted product' },
+  }));
 }
 
 export async function categoryPerformance(tenantId: Types.ObjectId, from: string, to: string) {
+  await refreshTodayIfInRange(tenantId, to);
   const rollups = await DailyRollup.find({ tenantId, date: { $gte: from, $lte: to } });
   const merged = new Map<string, number>();
   for (const r of rollups) {
@@ -66,9 +101,16 @@ export async function categoryPerformance(tenantId: Types.ObjectId, from: string
     }
   }
   const total = Array.from(merged.values()).reduce((a, b) => a + b, 0) || 1;
-  return Array.from(merged.entries())
+  const rows = Array.from(merged.entries())
     .map(([categoryId, revenue]) => ({ categoryId, revenue, share: Math.round((revenue / total) * 100) }))
     .sort((a, b) => b.revenue - a.revenue);
+
+  const categories = await Category.find({ _id: { $in: rows.map((r) => r.categoryId) } }).select('name');
+  const nameById = new Map(categories.map((c) => [String(c._id), c.name]));
+  return rows.map((r) => ({
+    ...r,
+    name: nameById.get(r.categoryId) ?? { en: 'Deleted category', ar: 'Deleted category' },
+  }));
 }
 
 /**

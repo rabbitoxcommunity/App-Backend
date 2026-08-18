@@ -254,6 +254,116 @@ export async function staffLogin(
   return { ...pair, user };
 }
 
+// ------------------------------------------------------------- delivery login
+
+/**
+ * Delivery staff sign in with the PHONE + PASSWORD their store admin set for
+ * them on the Admin staff screen (POST /admin/staff takes both).
+ *
+ * This is a separate entry point from staffLogin rather than a widening of
+ * it, because the two identify people differently: a storeAdmin is looked up
+ * by email, which /admin/staff requires for that role and makes optional for
+ * riders. Most delivery staff therefore have no email at all, and could
+ * never sign in through staffLogin.
+ *
+ * The phone is normalised on the way in, exactly as modules/staff/service.ts
+ * normalises it on the way out, so "050 214 8873", "+971502148873" and
+ * "0502148873" all resolve to the same rider.
+ */
+export async function deliveryLogin(
+  tenantSlug: string,
+  rawPhone: string,
+  password: string,
+  meta: { userAgent?: string; ip?: string },
+): Promise<TokenPair & { user: InstanceType<typeof User> }> {
+  const tenant = await Tenant.findOne({ slug: tenantSlug.toLowerCase() });
+  if (!tenant) throw AppError.notFound('Tenant');
+  assertTenantLive(tenant);
+
+  // LEGACY SHIM: modules/staff/service.ts now normalises phones on write, but
+  // riders created before that fix are stored exactly as an admin typed them
+  // ("07034327244", "050 214 8873"). Matching the raw input as well as the
+  // normalised form means those accounts still work instead of silently
+  // failing to log in. Drop the raw arm once existing rows are backfilled —
+  // it is compatibility, not design.
+  const phone = normalizePhone(rawPhone);
+  const candidates = [...new Set([phone, rawPhone.trim()])];
+
+  // A phone number can be shared by every rider in a small shop, so this is a
+  // find(), not a findOne(). The PASSWORD is what identifies the individual:
+  // whichever account on that number the password verifies against is the one
+  // signing in. createStaff refuses to let two staff on one number share a
+  // password, so at most one can ever match.
+  const matches = await User.find({
+    tenantId: tenant._id,
+    phone: { $in: candidates },
+    role: 'deliveryStaff',
+  }).select('+passwordHash');
+
+  const now = new Date();
+  const unlocked = matches.filter((u) => !(u.lockedUntil && u.lockedUntil > now));
+
+  if (matches.length > 0 && unlocked.length === 0) {
+    throw new AppError('ACCOUNT_LOCKED', 'Too many failed attempts. Try again later.');
+  }
+
+  let user: (typeof matches)[number] | null = null;
+  for (const candidate of unlocked) {
+    if (!candidate.passwordHash) continue;
+    if (await argon2.verify(candidate.passwordHash, password)) {
+      user = candidate;
+      break;
+    }
+  }
+
+  // One message for "no such rider" and "wrong password" alike — splitting
+  // them turns this into a way to enumerate a shop's roster.
+  if (!user) {
+    // Per-account lockout is only meaningful when the number identifies ONE
+    // person. Incrementing every account on a shared number would let one
+    // rider lock out the whole shop by fumbling their own password. For
+    // shared numbers the per-phone rate limit on the route is the throttle.
+    if (matches.length === 1) {
+      const only = matches[0]!;
+      only.failedLoginAttempts += 1;
+      if (only.failedLoginAttempts >= LOCK_THRESHOLD) {
+        only.lockedUntil = new Date(Date.now() + LOCK_MINUTES * 60 * 1000);
+        only.failedLoginAttempts = 0;
+      }
+      await only.save();
+    }
+    throw AppError.unauthenticated('Invalid phone number or password.');
+  }
+
+  if (user.status !== 'active') {
+    throw new AppError('ACCOUNT_BLOCKED', 'This account is not active.');
+  }
+
+  user.failedLoginAttempts = 0;
+  user.lockedUntil = null;
+  user.lastLoginAt = new Date();
+  // Signing in IS coming on shift. Riders are never offered an order while
+  // `off_shift` (see selectAndClaimRider), so without this a fresh login
+  // would sit staring at an empty list forever. An already-`on_delivery`
+  // rider keeps that state — they have live orders in hand.
+  // Signing in IS coming on shift. Nothing is allocated to riders any more,
+  // so this only drives what the dashboard shows about who is working — it no
+  // longer gates whether they receive orders. An already-`on_delivery` rider
+  // keeps that state; they have live orders in hand.
+  if (user.availability === 'off_shift') user.availability = 'available';
+  await user.save();
+
+  // Fetched with .select('+passwordHash') to verify the password — must not
+  // leak the hash in the response. No further .save() happens after this.
+  const pair = await issueTokenPair(
+    { sub: String(user._id), role: 'deliveryStaff', tenantId: String(tenant._id) },
+    { tenantId: tenant._id, userAgent: meta.userAgent, ip: meta.ip },
+  );
+
+  user.passwordHash = null;
+  return { ...pair, user };
+}
+
 // --------------------------------------------------------------- platform login
 
 export async function platformLogin(
