@@ -24,6 +24,8 @@ export type PricedLine = {
   name: Localized;
   variantLabel: Localized;
   icon: string;
+  /** Product photo at the time of pricing; null when the shop has not set one. */
+  imageUrl: string | null;
   stock: 'available' | 'low' | 'out';
   productId: string;
 };
@@ -108,6 +110,7 @@ export async function priceBasket(
       name: product.name,
       variantLabel: variantLabel(product, variant.optionIds as never, variant.label),
       icon: product.icon,
+      imageUrl: product.imageUrl ?? null,
       stock: variant.stock as 'available' | 'low' | 'out',
     });
   }

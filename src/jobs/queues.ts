@@ -20,6 +20,7 @@ export const QUEUE_NAMES = {
   riderTimeout: 'rider-offer-timeout',
   rollups: 'daily-rollups',
   invoices: 'monthly-invoices',
+  popularity: 'popularity-recompute',
 } as const;
 
 export const importQueue = new Queue(QUEUE_NAMES.import, { connection: queueConnection });

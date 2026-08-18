@@ -29,6 +29,19 @@ const client = new S3Client({
   region: 'auto',
   forcePathStyle: true,
   credentials: { accessKeyId: env.S3_KEY, secretAccessKey: env.S3_SECRET },
+  // MUST stay WHEN_REQUIRED for presigned PUTs to work from a browser.
+  //
+  // From v3.729.0 the SDK defaults to WHEN_SUPPORTED, which folds
+  // `x-amz-checksum-crc32` and `x-amz-sdk-checksum-algorithm` into the signed
+  // URL. At signing time there is no body, so the checksum it bakes in is
+  // CRC32 of zero bytes ("AAAAAA=="). The browser then PUTs the real file,
+  // the checksum does not match, and R2 rejects the request — with an error
+  // response that carries no Access-Control-Allow-Origin, so the browser
+  // reports it as a *CORS* failure rather than the 400 it actually is.
+  // Nothing in this file has to change for that to break: a plain
+  // `npm install` inside the caret range is enough.
+  requestChecksumCalculation: 'WHEN_REQUIRED',
+  responseChecksumValidation: 'WHEN_REQUIRED',
 });
 
 export type UploadPurpose =

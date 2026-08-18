@@ -36,6 +36,10 @@ const OrderLineSchema = new Schema(
     name: { type: LocalizedSchema, required: true },
     variantLabel: { type: LocalizedSchema, required: true },
     icon: { type: String, required: true },
+    // Snapshotted alongside name/price so an order stays renderable after the
+    // product is edited or deleted. Null on orders placed before this field
+    // existed — clients fall back to the live catalogue, then to `icon`.
+    imageUrl: { type: String, default: null },
     fulfilledQty: { type: Number, default: null }, // §9.6, defaults to quantity until packed
     substitutedFor: { type: Schema.Types.ObjectId, default: null },
   },

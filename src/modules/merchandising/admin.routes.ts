@@ -15,6 +15,13 @@ const merchandisingSchema = z.object({
   categoryOrder: z.array(z.string()).optional(),
 });
 
+adminMerchandisingRouter.get(
+  '/merchandising',
+  asyncHandler(async (req, res) => {
+    res.json(await service.getMerchandising(req.ctx.tenantId!));
+  }),
+);
+
 adminMerchandisingRouter.put(
   '/merchandising',
   validate({ body: merchandisingSchema }),

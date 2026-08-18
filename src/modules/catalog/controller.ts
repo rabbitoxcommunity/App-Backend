@@ -24,7 +24,18 @@ export const listProductsQuery = paginationQuery.extend({
     .transform((v) => (v === undefined ? undefined : v === 'true')),
 });
 
-export const searchQuery = paginationQuery.extend({ q: z.string().min(1) });
+// Same filter surface as listProductsQuery so a search result page can behave
+// like a category listing instead of being a second, weaker code path.
+export const searchQuery = paginationQuery.extend({
+  q: z.string().min(1),
+  sort: z.enum(['popularity', 'newest', 'priceAsc', 'priceDesc']).optional(),
+  minPrice: z.coerce.number().optional(),
+  maxPrice: z.coerce.number().optional(),
+  inStock: z
+    .enum(['true', 'false'])
+    .optional()
+    .transform((v) => (v === undefined ? undefined : v === 'true')),
+});
 
 export const adminListCategoriesQuery = z.object({
   page: z.coerce.number().int().min(1).default(1),

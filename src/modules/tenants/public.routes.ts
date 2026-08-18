@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { Tenant } from '../../models/Tenant.js';
+import { Product } from '../../models/Product.js';
 import { asyncHandler } from '../../lib/asyncHandler.js';
 import { AppError } from '../../lib/errors.js';
 import { assertTenantLive, isTrialExpired } from '../../lib/tenantAccess.js';
@@ -53,12 +54,25 @@ tenantPublicRouter.get(
     if (!tenant) throw AppError.notFound('Tenant');
     assertTenantLive(tenant);
 
+    /**
+     * Real price span of what this shop sells, so the app's filter slider spans
+     * the catalogue instead of a constant copied from a design mock. The old
+     * hardcoded AED 50 ceiling made every product above it unreachable.
+     * In fils, like every other price on the wire.
+     */
+    const [range] = await Product.aggregate<{ min: number; max: number }>([
+      { $match: { status: 'published', archivedAt: null } },
+      { $unwind: '$variants' },
+      { $group: { _id: null, min: { $min: '$variants.price' }, max: { $max: '$variants.price' } } },
+    ]);
+
     res.json({
       name: tenant.name,
       branding: tenant.branding,
       locale: tenant.locale,
       store: tenant.store,
       settings: tenant.settings,
+      priceRange: { min: range?.min ?? 0, max: range?.max ?? 0 },
     });
   }),
 );

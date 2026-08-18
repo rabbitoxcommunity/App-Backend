@@ -2,6 +2,7 @@ import { startImportWorker } from '../modules/import/worker.js';
 import { startRiderTimeoutWorker } from '../modules/orders/riderTimeoutWorker.js';
 import { startRollupWorker, scheduleRollups } from './rollups.js';
 import { startInvoiceWorker, scheduleInvoices } from './invoices.js';
+import { startPopularityWorker, schedulePopularity } from './popularity.js';
 import { registerNotificationListeners } from '../modules/notifications/listeners.js';
 import { logger } from '../config/logger.js';
 
@@ -11,8 +12,10 @@ export async function startAllWorkers(): Promise<void> {
   startRiderTimeoutWorker();
   startRollupWorker();
   startInvoiceWorker();
+  startPopularityWorker();
   registerNotificationListeners();
   await scheduleRollups();
   await scheduleInvoices();
+  await schedulePopularity();
   logger.info('Background workers started');
 }

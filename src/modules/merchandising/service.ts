@@ -17,14 +17,58 @@ export async function getHome(tenantId: Types.ObjectId) {
   ]);
 
   const popularIds = merch?.popularProductIds ?? [];
-  const popular = popularIds.length
-    ? await Product.find({ tenantId, _id: { $in: popularIds }, status: 'published', archivedAt: null })
-    : await Product.find({ tenantId, status: 'published', archivedAt: null }).sort({ popularity: -1 }).limit(10);
+
+  let popular;
+  if (popularIds.length) {
+    // Re-ordered in the id sequence the owner curated. `$in` returns documents
+    // in Mongo's natural order, so the app's rail came out in a different order
+    // from the one shown in the CMS — reversed, in testing.
+    const found = await Product.find({
+      tenantId,
+      _id: { $in: popularIds },
+      status: 'published',
+      archivedAt: null,
+    });
+    const byId = new Map(found.map((p) => [String(p._id), p]));
+    // Unpublished or deleted ids are skipped rather than left as holes.
+    popular = popularIds.map((id) => byId.get(String(id))).filter((p) => p != null);
+  } else {
+    popular = await Product.find({ tenantId, status: 'published', archivedAt: null })
+      .sort({ popularity: -1 })
+      .limit(10);
+  }
 
   return {
     banners,
     popular,
     trending: merch?.trendingSearches ?? [],
+  };
+}
+
+/**
+ * ADMIN GAP FILL — only a PUT existed, so the CMS had no way to read the
+ * current curation back and therefore no way to build an editor for it.
+ *
+ * Returns the products hydrated and IN `popularProductIds` ORDER, because that
+ * order is what `getHome` serves to the app — a `$in` query returns whatever
+ * order Mongo likes, which would make the editor show a different sequence from
+ * the storefront.
+ */
+export async function getMerchandising(tenantId: Types.ObjectId) {
+  const merch = await Merchandising.findOne({ tenantId });
+  const ids = merch?.popularProductIds ?? [];
+
+  const products = ids.length
+    ? await Product.find({ tenantId, _id: { $in: ids }, archivedAt: null })
+    : [];
+  const byId = new Map(products.map((p) => [String(p._id), p]));
+
+  return {
+    // Ids whose product was deleted are dropped rather than returned as holes.
+    popular: ids.map((id) => byId.get(String(id))).filter((p) => p != null),
+    popularProductIds: ids.map(String),
+    trendingSearches: merch?.trendingSearches ?? [],
+    categoryOrder: merch?.categoryOrder ?? [],
   };
 }
 

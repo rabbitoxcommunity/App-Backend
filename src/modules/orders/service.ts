@@ -123,6 +123,7 @@ export async function placeOrder(
               name: l.name,
               variantLabel: l.variantLabel,
               icon: l.icon,
+              imageUrl: l.imageUrl,
               fulfilledQty: l.quantity,
             })),
             subtotal: priced.subtotal,

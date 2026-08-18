@@ -48,6 +48,18 @@ async function paginateProducts(
   };
   const sort = sortMap[opts.sort ?? 'popularity'] ?? sortMap.popularity;
 
+  /**
+   * Price span of this result set, so the app's slider spans what the customer
+   * is actually looking at. A catalogue-wide range is useless per listing —
+   * CHOCOLATES tops out at AED 48 but the whole shop reaches 645, leaving over
+   * 90% of the track dead.
+   *
+   * Deliberately snapshotted BEFORE the price window is applied: computing it
+   * afterwards would collapse the range onto the current selection, and the
+   * slider could never be widened again.
+   */
+  const rangeFilter = { ...filter };
+
   if (opts.minPrice != null || opts.maxPrice != null) {
     filter['variants.price'] = {
       ...(opts.minPrice != null ? { $gte: opts.minPrice } : {}),
@@ -56,11 +68,23 @@ async function paginateProducts(
   }
 
   const skip = (opts.page - 1) * opts.limit;
-  const [items, total] = await Promise.all([
+  const [items, total, range] = await Promise.all([
     Product.find(filter).sort(sort).skip(skip).limit(opts.limit),
     Product.countDocuments(filter),
+    Product.aggregate<{ min: number; max: number }>([
+      { $match: rangeFilter },
+      { $unwind: '$variants' },
+      { $group: { _id: null, min: { $min: '$variants.price' }, max: { $max: '$variants.price' } } },
+    ]),
   ]);
-  return { items, page: opts.page, limit: opts.limit, total };
+
+  return {
+    items,
+    page: opts.page,
+    limit: opts.limit,
+    total,
+    priceRange: { min: range[0]?.min ?? 0, max: range[0]?.max ?? 0 },
+  };
 }
 
 export async function listProducts(opts: {
@@ -78,14 +102,18 @@ export async function listProducts(opts: {
   // productStock()/isPurchasable() rule. A plain { $ne: 'out' } would instead
   // demand that NO variant is out, hiding partially-out products.
   if (opts.inStock) filter['variants.stock'] = { $in: ['available', 'low'] };
+  /**
+   * Real ObjectIds, not the raw strings. `find()` casts strings via the schema
+   * so this looked fine for years, but `aggregate()` does NOT — the priceRange
+   * pipeline's `$match` silently matched nothing and every category reported a
+   * range of 0–0.
+   */
   if (opts.category) {
-    filter.categoryId = Types.ObjectId.isValid(opts.category) ? opts.category : undefined;
-    if (!filter.categoryId) {
-      const cat = await Category.findOne({ slug: opts.category });
-      filter.categoryId = cat?._id ?? new Types.ObjectId(); // no match -> empty result
-    }
+    filter.categoryId = Types.ObjectId.isValid(opts.category)
+      ? new Types.ObjectId(opts.category)
+      : ((await Category.findOne({ slug: opts.category }))?._id ?? new Types.ObjectId()); // no match -> empty result
   }
-  if (opts.sub && Types.ObjectId.isValid(opts.sub)) filter.subcategoryId = opts.sub;
+  if (opts.sub && Types.ObjectId.isValid(opts.sub)) filter.subcategoryId = new Types.ObjectId(opts.sub);
   return paginateProducts(filter, opts);
 }
 
@@ -97,13 +125,28 @@ export async function getProduct(id: string) {
 }
 
 /** §20.1 — every query, including zero-result ones, writes a searchLog. */
-export async function search(q: string, customerId: string | null, opts: { page: number; limit: number }) {
+export async function search(
+  q: string,
+  customerId: string | null,
+  opts: {
+    page: number;
+    limit: number;
+    sort?: string;
+    minPrice?: number;
+    maxPrice?: number;
+    inStock?: boolean;
+  },
+) {
   const tokens = buildSearchTokens([q]);
   const filter: FilterQuery<typeof Product> = {
     status: 'published',
     archivedAt: null,
+    // Barcodes are part of a product's searchTokens (see createProduct and the
+    // importer), so scanning a barcode into the search box resolves here too.
     searchTokens: { $in: tokens.map((t) => new RegExp(`^${escapeRegex(t)}`)) },
   };
+  // Mirrors listProducts: at least one sellable variant.
+  if (opts.inStock) filter['variants.stock'] = { $in: ['available', 'low'] };
 
   const result = await paginateProducts(filter, opts);
 
