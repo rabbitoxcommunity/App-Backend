@@ -81,6 +81,16 @@ const tenantSchema = new Schema(
       planId: { type: Schema.Types.ObjectId, ref: 'Plan', default: null },
       startedAt: { type: Date, default: () => new Date() },
       trialEndsAt: { type: Date, default: null },
+      /**
+       * Paid through this date — the end of the current annual term. Renewal
+       * extends it from its own previous value, never from the payment date, so
+       * the anniversary cannot drift when a shop pays late.
+       *
+       * Deliberately separate from `status`, exactly as `trialEndsAt` is: giving
+       * a shop another month stays a one-field change instead of also unwinding
+       * a stored suspension.
+       */
+      expiresAt: { type: Date, default: null },
       billingAnchorDay: { type: Number, default: () => new Date().getDate() }, // §25.5
       seats: { type: Number, default: 3 },
     },

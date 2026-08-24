@@ -3,6 +3,7 @@ import { Types } from 'mongoose';
 import argon2 from 'argon2';
 import { Tenant } from '../../models/Tenant.js';
 import { Plan } from '../../models/Plan.js';
+import { Product } from '../../models/Product.js';
 import { Invoice } from '../../models/Invoice.js';
 import { PlatformUser } from '../../models/PlatformUser.js';
 import { DailyRollup } from '../../models/DailyRollup.js';
@@ -86,6 +87,68 @@ export async function configureTenant(id: string, input: Record<string, unknown>
 }
 
 /** §19.4 — SUSPENSION IS A DELIBERATE HUMAN ACTION, never automatic. */
+/**
+ * Puts a shop onto a paid plan, or extends the one it is on.
+ *
+ * This is the missing half of billing: onboarding always created a 14-day trial
+ * with `planId: null`, and nothing anywhere could change that — so no tenant
+ * could ever be invoiced. The only way to convert a shop was a hand-written
+ * database script.
+ *
+ * Setting a plan ends the trial. `trialEndsAt` is cleared so the two expiry
+ * signals can never both be live and disagree about why a shop is blocked.
+ */
+export async function setTenantSubscription(
+  id: string,
+  input: { planId: string; expiresAt?: string | Date | null },
+) {
+  const tenant = await Tenant.findById(id);
+  if (!tenant) throw AppError.notFound('Tenant');
+
+  const plan = await Plan.findById(input.planId);
+  if (!plan) throw AppError.notFound('Plan');
+
+  // Default term: a year for annual plans, a month for monthly ones. An explicit
+  // date always wins, so a mid-cycle or contract-matched term is possible.
+  let expiresAt: Date | null = input.expiresAt ? new Date(input.expiresAt) : null;
+  if (!expiresAt) {
+    expiresAt = new Date();
+    if (plan.billingPeriod === 'yearly') expiresAt.setFullYear(expiresAt.getFullYear() + 1);
+    else expiresAt.setMonth(expiresAt.getMonth() + 1);
+  }
+  if (Number.isNaN(expiresAt.getTime())) {
+    throw AppError.validationFailed({ expiresAt: 'Not a valid date.' });
+  }
+  if (expiresAt < new Date()) {
+    throw AppError.validationFailed({ expiresAt: 'The term end must be in the future.' });
+  }
+
+  /**
+   * A plan's product limit is only enforced once a plan exists (assertProductLimit
+   * returns early when there is none). Attaching one to a shop that already has
+   * more products than the plan allows would silently break every product create
+   * and every Excel import from that moment — so refuse it here, where it can be
+   * explained, rather than at 2am in an import job.
+   */
+  const productCount = await Product.countDocuments({ tenantId: tenant._id, archivedAt: null });
+  if (plan.limits?.products != null && productCount > plan.limits.products) {
+    throw new AppError(
+      'PLAN_LIMIT_REACHED',
+      `This shop has ${productCount} products but the "${plan.name.en}" plan allows ${plan.limits.products}. Raise the plan's product limit first.`,
+      { current: productCount, limit: plan.limits.products },
+    );
+  }
+
+  tenant.plan!.planId = plan._id;
+  tenant.plan!.startedAt = tenant.plan!.startedAt ?? new Date();
+  tenant.plan!.expiresAt = expiresAt;
+  tenant.plan!.trialEndsAt = null;
+  if (tenant.status === 'trial') tenant.status = 'active';
+  await tenant.save();
+
+  return tenant;
+}
+
 export async function suspendTenant(id: string) {
   const tenant = await Tenant.findByIdAndUpdate(id, { status: 'suspended', suspendedAt: new Date() }, { new: true });
   if (!tenant) throw AppError.notFound('Tenant');
@@ -209,19 +272,56 @@ export async function listInvoices(opts: { tenantId?: string; status?: string; p
 }
 
 export async function issueInvoice(id: string) {
-  const invoice = await Invoice.findByIdAndUpdate(id, { status: 'issued', issuedAt: new Date() }, { new: true });
+  const invoice = await Invoice.findById(id);
   if (!invoice) throw AppError.notFound('Invoice');
+  // Guarded: this was a bare findByIdAndUpdate, so issuing an already-paid
+  // invoice silently knocked it back to `issued` and lost the payment state.
+  if (invoice.status !== 'draft') {
+    throw new AppError('INVALID_TRANSITION', `Only a draft invoice can be issued — this one is "${invoice.status}".`);
+  }
+  invoice.status = 'issued';
+  invoice.issuedAt = new Date();
+  await invoice.save();
   return invoice;
 }
 
-/** D14 — payment collection is manual in v1; there is no gateway (D12). */
+/**
+ * D14 — payment collection is manual in v1; there is no gateway (D12).
+ *
+ * Recording payment on an annual invoice is also what RENEWS the subscription:
+ * it pushes `tenant.plan.expiresAt` forward a year from its own previous value,
+ * never from today. Paying eight days late therefore costs the shop those eight
+ * days rather than shifting every future anniversary later.
+ */
 export async function markInvoicePaid(id: string, paymentRef: string) {
-  const invoice = await Invoice.findByIdAndUpdate(
-    id,
-    { status: 'paid', paidAt: new Date(), paymentRef },
-    { new: true },
-  );
+  const invoice = await Invoice.findById(id);
   if (!invoice) throw AppError.notFound('Invoice');
+  if (invoice.status === 'paid') {
+    throw new AppError('INVALID_TRANSITION', 'This invoice is already marked paid.');
+  }
+  if (invoice.status === 'void') {
+    throw new AppError('INVALID_TRANSITION', 'This invoice has been voided.');
+  }
+
+  invoice.status = 'paid';
+  invoice.paidAt = new Date();
+  invoice.paymentRef = paymentRef;
+  await invoice.save();
+
+  const tenant = await Tenant.findById(invoice.tenantId);
+  if (tenant?.plan?.planId) {
+    const plan = await Plan.findById(tenant.plan.planId);
+    if (plan?.billingPeriod === 'yearly') {
+      // Extend from the existing term end when there is one, so anniversaries
+      // hold; otherwise this is the first term and it starts now.
+      const base = tenant.plan.expiresAt ?? new Date();
+      const next = new Date(base);
+      next.setFullYear(next.getFullYear() + 1);
+      tenant.plan.expiresAt = next;
+      await tenant.save();
+    }
+  }
+
   return invoice;
 }
 

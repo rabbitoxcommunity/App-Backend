@@ -13,6 +13,11 @@ platformRouter.get('/tenants', asyncHandler(controller.listTenants));
 platformRouter.post('/tenants', validate({ body: controller.onboardSchema }), asyncHandler(controller.onboard));
 platformRouter.get('/tenants/:id', asyncHandler(controller.getTenant));
 platformRouter.patch('/tenants/:id', asyncHandler(controller.configure));
+platformRouter.patch(
+  '/tenants/:id/subscription',
+  validate({ body: controller.subscriptionSchema }),
+  asyncHandler(controller.setSubscription),
+);
 platformRouter.post('/tenants/:id/suspend', asyncHandler(controller.suspend));
 platformRouter.post('/tenants/:id/reactivate', asyncHandler(controller.reactivate));
 platformRouter.post('/tenants/:id/reset-owner-access', asyncHandler(controller.resetOwnerAccess));
@@ -20,7 +25,7 @@ platformRouter.post('/tenants/:id/impersonate', asyncHandler(controller.imperson
 
 platformRouter.get('/plans', asyncHandler(controller.listPlans));
 platformRouter.post('/plans', validate({ body: controller.planSchema }), asyncHandler(controller.createPlan));
-platformRouter.patch('/plans/:id', validate({ body: controller.planSchema.partial() }), asyncHandler(controller.updatePlan));
+platformRouter.patch('/plans/:id', validate({ body: controller.planBaseSchema.partial() }), asyncHandler(controller.updatePlan));
 platformRouter.delete('/plans/:id', asyncHandler(controller.deletePlan));
 
 platformRouter.get('/invoices', asyncHandler(controller.listInvoices));

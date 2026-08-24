@@ -18,14 +18,50 @@ export const onboardSchema = z.object({
   ownerPhone: z.string().min(6),
   ownerPassword: z.string().min(8),
   storeName: localizedSchema,
+  /**
+   * Optional: sell a shop straight onto a paid plan. Omit both and it is
+   * created on the 14-day trial exactly as before, which is still the right
+   * default for a shop that has not signed yet.
+   */
+  planId: z.string().min(1).optional(),
+  expiresAt: z.string().min(1).nullable().optional(),
 });
 
-export const planSchema = z.object({
-  code: z.string().min(1),
-  name: localizedSchema,
-  priceMonthly: z.number().int().min(0),
-  limits: z.object({ products: z.number().optional(), ordersPerMonth: z.number().optional(), staffSeats: z.number().optional() }).optional(),
+// The bare object is exported too: PATCH needs `.partial()`, which does not
+// exist on the refined (ZodEffects) version.
+export const planBaseSchema = z.object({
+    code: z.string().min(1),
+    name: localizedSchema,
+    /**
+     * The term the plan is sold on. Without this in the schema, `validate()`
+     * stripped it from the body — so a plan created through Superadmin was
+     * always monthly no matter what the form sent, and `priceYearly` was
+     * silently discarded.
+     */
+    billingPeriod: z.enum(['monthly', 'yearly']).default('monthly'),
+    priceMonthly: z.number().int().min(0).default(0),
+    priceYearly: z.number().int().min(0).default(0),
+    limits: z.object({ products: z.number().optional(), ordersPerMonth: z.number().optional(), staffSeats: z.number().optional() }).optional(),
   features: z.array(z.string()).optional(),
+});
+
+// A plan priced at 0 for its own term is almost certainly a mistake reaching
+// the database, not a free tier someone meant to create.
+export const planSchema = planBaseSchema.superRefine((data, ctx) => {
+    const price = data.billingPeriod === 'yearly' ? data.priceYearly : data.priceMonthly;
+    if (price <= 0 && data.code !== 'trial') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [data.billingPeriod === 'yearly' ? 'priceYearly' : 'priceMonthly'],
+        message: `A ${data.billingPeriod} plan needs a price above zero.`,
+      });
+    }
+  });
+
+export const subscriptionSchema = z.object({
+  planId: z.string().min(1),
+  /** Optional — omitted means "one full term from today". */
+  expiresAt: z.string().datetime().or(z.string().min(1)).nullable().optional(),
 });
 
 export const platformUserSchema = z.object({
@@ -44,9 +80,22 @@ export async function getTenant(req: Request, res: Response): Promise<void> {
 }
 
 export async function onboard(req: Request, res: Response): Promise<void> {
-  const result = await service.onboard(req.body);
+  const { planId, expiresAt, ...onboardInput } = req.body;
+  const result = await service.onboard(onboardInput);
+
+  /**
+   * Composed server-side rather than asking the client to make a second call:
+   * a shop that got created but never got its plan is the exact state that made
+   * billing inert in the first place. Reuses setTenantSubscription so the date
+   * defaulting and the plan-limit check live in one place.
+   */
+  if (planId) {
+    await service.setTenantSubscription(result.tenantId, { planId, expiresAt });
+  }
+
   await writePlatformAudit(req, result.tenantId, 'platform.onboard', result.tenantId, {
     slug: { before: null, after: req.body.slug },
+    planId: { before: null, after: planId ?? null },
   });
   res.status(201).json(result);
 }
@@ -55,6 +104,15 @@ export async function configure(req: Request, res: Response): Promise<void> {
   const tenant = await service.configureTenant(req.params.id!, req.body);
   await writePlatformAudit(req, req.params.id!, 'platform.configure', req.params.id!, {
     fields: { before: null, after: Object.keys(req.body) },
+  });
+  res.json(tenant);
+}
+
+export async function setSubscription(req: Request, res: Response): Promise<void> {
+  const tenant = await service.setTenantSubscription(req.params.id!, req.body);
+  await writePlatformAudit(req, req.params.id!, 'platform.subscription', req.params.id!, {
+    planId: { before: null, after: req.body.planId },
+    expiresAt: { before: null, after: tenant.plan?.expiresAt ?? null },
   });
   res.json(tenant);
 }
