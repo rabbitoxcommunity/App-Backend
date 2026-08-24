@@ -27,7 +27,18 @@ const schema = z.object({
   OTP_SENDER_ID: z.string().default(''),
   WHATSAPP_BSP_KEY: z.string().default(''),
 
-  EXPO_ACCESS_TOKEN: z.string().default(''),
+  /**
+   * §15 PUSH — Firebase Cloud Messaging. One service account for the whole
+   * Firebase project; every white-label shop app is a separate *app* inside
+   * that same project, so one credential reaches all of them.
+   *
+   * Supply EITHER the JSON itself (FIREBASE_SERVICE_ACCOUNT, handy for hosts
+   * that only offer env vars) or a path to the key file
+   * (GOOGLE_APPLICATION_CREDENTIALS). Both empty = push is logged, not sent,
+   * exactly like OTP_PROVIDER=console.
+   */
+  FIREBASE_SERVICE_ACCOUNT: z.string().default(''),
+  GOOGLE_APPLICATION_CREDENTIALS: z.string().default(''),
 
   ENCRYPTION_KEY: z.string().default(''),
 

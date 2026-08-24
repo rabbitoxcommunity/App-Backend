@@ -1,5 +1,5 @@
 import { domainEvents } from '../../lib/domainEvents.js';
-import { sendExpoPush } from '../../lib/expoPush.js';
+import { sendPush } from '../../lib/push.js';
 import { User } from '../../models/User.js';
 import { NotifyRequest } from '../../models/NotifyRequest.js';
 import { pickLanguage } from '../../lib/localized.js';
@@ -48,7 +48,23 @@ async function pushToUser(
   const user = await User.findById(userId);
   if (!user || user.pushTokens.length === 0) return;
   const text = typeof body === 'string' ? body : pickLanguage(body, (user.language as 'en' | 'ar') ?? 'en');
-  await sendExpoPush(user.pushTokens.map((t) => ({ to: t.token, title, body: text, data })));
+
+  const { invalidTokens } = await sendPush(
+    user.pushTokens.map((t) => ({ token: t.token, title, body: text, data })),
+  );
+
+  /**
+   * Drop tokens FCM has told us are dead (app uninstalled, token rotated).
+   * Without this every stale token is retried on every future notification for
+   * the life of the account, and a customer who reinstalls a few times
+   * accumulates tokens that can never deliver.
+   */
+  if (invalidTokens.length > 0) {
+    await User.updateOne(
+      { _id: user._id },
+      { $pull: { pushTokens: { token: { $in: invalidTokens } } } },
+    );
+  }
 }
 
 async function notifyOrderStatus({ order }: { tenantId: string; order: OrderDoc }) {
@@ -80,7 +96,10 @@ async function notifyLinesChanged({ order }: { tenantId: string; order: OrderDoc
   await pushToUser(
     order.customerId,
     `Order #${order.reference} updated`,
-    'Some items in your order were substituted or unavailable — check your receipt.',
+    {
+      en: 'Some items in your order were substituted or unavailable — check your receipt.',
+      ar: 'بعض المنتجات في طلبك تم استبدالها أو كانت غير متوفرة — راجع الفاتورة.',
+    },
     { orderId: String(order._id) },
   );
 }

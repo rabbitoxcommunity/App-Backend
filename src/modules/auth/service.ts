@@ -150,6 +150,28 @@ export async function refreshTokenPair(
   let claims: Omit<AccessTokenClaims, 'jti'>;
 
   if (row.tenantId) {
+    /**
+     * The tenant is re-checked on every rotation, not only at sign-in.
+     * assertTenantLive guarded the three login paths and nothing else, so a
+     * shop whose subscription lapsed (or that was suspended, or whose trial
+     * ran out) kept working indefinitely for anyone already signed in — the
+     * session just refreshed its way past the cut-off forever, and only a
+     * fresh login was ever stopped. Enforcement belongs to the session, not
+     * to the moment of sign-in.
+     *
+     * Deliberately NOT revoking the family here: refusing is enough (every
+     * client turns a failed refresh into a sign-out), and leaving the tokens
+     * intact means paying the invoice restores service without forcing every
+     * rider and cashier to re-authenticate.
+     *
+     * The user sees a generic "session expired" from this path; the login
+     * attempt that follows hits assertTenantLive again, which is where the
+     * real reason is spelled out.
+     */
+    const tenant = await Tenant.findById(row.tenantId);
+    if (!tenant) throw new AppError('UNAUTHENTICATED', 'Account is no longer active.');
+    assertTenantLive(tenant);
+
     // Filter already carries an explicit tenantId, so the isolation plugin
     // trusts it without needing request context (there is none yet here —
     // this runs before any tenant is known to this request).
