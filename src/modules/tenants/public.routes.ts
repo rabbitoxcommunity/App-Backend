@@ -3,41 +3,9 @@ import { Tenant } from '../../models/Tenant.js';
 import { Product } from '../../models/Product.js';
 import { asyncHandler } from '../../lib/asyncHandler.js';
 import { AppError } from '../../lib/errors.js';
-import { assertTenantLive, isTrialExpired } from '../../lib/tenantAccess.js';
+import { assertTenantLive } from '../../lib/tenantAccess.js';
 
 export const tenantPublicRouter = Router();
-
-/**
- * GET /tenants, public — no auth, no X-Tenant-Id required. Backs the
- * customer app's shop picker (the app has no build-time tenant anymore; the
- * customer picks a live shop here first). Field list is a deliberate
- * whitelist, not `Tenant.find()` + default toJSON — `contact.{email,phone}`
- * and `gateway.credentialsEnc` must never reach an unauthenticated response.
- */
-tenantPublicRouter.get(
-  '/tenants',
-  asyncHandler(async (_req, res) => {
-    const tenants = await Tenant.find({ status: { $in: ['trial', 'active'] } })
-      .select('slug name branding.logoUrl branding.primaryHex store.name store.address store.geo status plan.trialEndsAt')
-      .sort({ createdAt: -1 })
-      .limit(200);
-
-    res.json({
-      items: tenants
-        .filter((t) => !isTrialExpired(t))
-        .map((t) => ({
-          id: String(t._id),
-          slug: t.slug,
-          name: t.name,
-          logoUrl: t.branding?.logoUrl ?? null,
-          primaryHex: t.branding?.primaryHex ?? '#2E7A12',
-          storeName: t.store?.name ?? t.name,
-          address: t.store?.address ?? null,
-          geo: t.store?.geo?.lat != null && t.store?.geo?.lng != null ? { lat: t.store.geo.lat, lng: t.store.geo.lng } : null,
-        })),
-    });
-  }),
-);
 
 /**
  * §10 — GET /config, public. Every module needs a trustworthy place to read
