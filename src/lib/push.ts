@@ -17,6 +17,13 @@ import { logger } from '../config/logger.js';
  * FCM token, which the Expo endpoint cannot accept.
  */
 
+/**
+ * Must match the channel the app creates (src/hooks/usePushRegistration.ts).
+ * A channelId Android does not know falls back to a DEFAULT-importance
+ * channel, which is exactly the silent-in-the-shade behaviour this avoids.
+ */
+export const ANDROID_CHANNEL_ID = 'orders';
+
 export type PushMessage = {
   token: string;
   title: string;
@@ -112,8 +119,30 @@ export async function sendPush(messages: PushMessage[]): Promise<PushResult> {
             typeof v === 'string' ? v : JSON.stringify(v),
           ]),
         ),
-        android: { priority: 'high' as const },
-        apns: { payload: { aps: { sound: 'default' } } },
+        /**
+         * `priority: high` wakes a dozing device instead of holding the
+         * message until the next maintenance window — an order update is
+         * time-critical, and Doze can otherwise delay it by many minutes.
+         *
+         * `channelId` targets a channel the app creates at HIGH importance, so
+         * the notification pops as a banner over whatever the customer is
+         * doing rather than only landing silently in the shade. Without it
+         * Android falls back to a DEFAULT-importance channel: audible, but no
+         * banner.
+         */
+        android: {
+          priority: 'high' as const,
+          notification: {
+            channelId: ANDROID_CHANNEL_ID,
+            sound: 'default',
+            priority: 'high' as const,
+            defaultVibrateTimings: true,
+          },
+        },
+        apns: {
+          headers: { 'apns-priority': '10' },
+          payload: { aps: { sound: 'default', 'interruption-level': 'time-sensitive' } },
+        },
       })),
     );
 

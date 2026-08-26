@@ -69,6 +69,7 @@ async function pushToUser(
 
 async function notifyOrderStatus({ order }: { tenantId: string; order: OrderDoc }) {
   const copy: Record<string, { en: string; ar: string }> = {
+    placed: { en: 'Order confirmed — we have started on it.', ar: 'تم تأكيد طلبك — بدأنا العمل عليه.' },
     packed: { en: 'Your order is being packed.', ar: 'جارٍ تجهيز طلبك.' },
     out_for_delivery: { en: 'Your order is on its way!', ar: 'طلبك في الطريق!' },
     delivered: { en: 'Your order has been delivered.', ar: 'تم توصيل طلبك.' },

@@ -183,6 +183,17 @@ export async function placeOrder(
   // dashboard — see manualAssignRider.
   realtime.orderCreated(String(tenantId), order.toJSON());
 
+  /**
+   * §15 — confirm the order to the customer.
+   *
+   * Order creation is not a status TRANSITION, so it never reached
+   * `order.status.changed` and the customer got nothing until the shop packed
+   * it: the one moment they most want a receipt-style confirmation was the one
+   * moment nothing was sent. Emitting the same event keeps every order
+   * notification going through one listener.
+   */
+  domainEvents.emit('order.status.changed', { tenantId: String(tenantId), order });
+
   return order;
 }
 
